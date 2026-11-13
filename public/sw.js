@@ -73,6 +73,100 @@ self.addEventListener('fetch', (event) => {
   })());
 });
 
+// ---------------------------------------------------------------- background mailbox check
+//
+// Chromium can wake an *installed* PWA with Periodic Background Sync. The browser decides
+// how often (based on engagement, typically a few times a day at most), so this is
+// best-effort. The worker never decrypts anything: it copies still-encrypted events from the
+// user's OWN mailbox relays into IndexedDB and shows a content-free notification. The app
+// verifies, decrypts and merges them the next time it opens.
+
+const MAIL_KIND = 4050;
+const MAIL_TTL_S = 7 * 86400;
+
+self.addEventListener('periodicsync', (event) => {
+  if (event.tag === 'iwt-mailbox') event.waitUntil(checkMailbox());
+});
+
+function openDB() {
+  return new Promise((resolve) => {
+    const req = indexedDB.open('iwt');
+    req.onupgradeneeded = (e) => { if (e.oldVersion === 0) req.transaction.abort(); }; // no app data yet
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => db.close();
+      resolve(db.objectStoreNames.contains('inbox') ? db : (db.close(), null));
+    };
+    req.onerror = () => resolve(null);
+  });
+}
+
+function idb(db, store, mode, fn) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, mode);
+    const r = fn(tx.objectStore(store));
+    tx.oncomplete = () => resolve(r && r.result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function inboxTopic(fp, day) {
+  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('iwt-inbox-v1|' + fp + '|' + day)));
+  return Array.from(h.slice(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function fetchRelay(url, filter, ms = 15000) {
+  return new Promise((resolve) => {
+    const events = [];
+    let ws;
+    const sub = 'bg' + Math.random().toString(36).slice(2, 8);
+    const done = () => { clearTimeout(t); try { ws.close(); } catch {} resolve(events); };
+    const t = setTimeout(done, ms);
+    try { ws = new WebSocket(url); } catch { return done(); }
+    ws.onopen = () => ws.send(JSON.stringify(['REQ', sub, filter]));
+    ws.onmessage = (m) => {
+      let msg;
+      try { msg = JSON.parse(m.data); } catch { return; }
+      if (msg[0] === 'EVENT' && msg[1] === sub && msg[2] && msg[2].kind === MAIL_KIND) events.push(msg[2]);
+      if (msg[0] === 'EOSE' && msg[1] === sub) done();
+    };
+    ws.onerror = done;
+  });
+}
+
+async function checkMailbox() {
+  // If the app is open it is already listening live.
+  const windows = await self.clients.matchAll({ type: 'window' });
+  if (windows.some((c) => c.visibilityState === 'visible')) return;
+  const db = await openDB();
+  if (!db) return;
+  try {
+    const bg = await idb(db, 'kv', 'readonly', (s) => s.get('bg'));
+    const relays = (bg && bg.mailboxRelays) || [];
+    if (!bg || !bg.fp || !relays.length) return;
+    const today = Math.floor(Date.now() / 86400000);
+    const topics = await Promise.all(Array.from({ length: 10 }, (_, i) => inboxTopic(bg.fp, today - 8 + i)));
+    const floor = Math.floor(Date.now() / 1000) - MAIL_TTL_S;
+    const since = Math.max(floor, (bg.mailSince || 0) - 3600);
+    const batches = await Promise.all(relays.map((u) => fetchRelay(u, { kinds: [MAIL_KIND], '#t': topics, since })));
+    let fresh = 0;
+    for (const ev of batches.flat()) {
+      if (typeof ev.id !== 'string' || typeof ev.content !== 'string') continue;
+      if (await idb(db, 'inbox', 'readonly', (s) => s.get(ev.id))) continue;
+      await idb(db, 'inbox', 'readwrite', (s) => s.put(ev, ev.id));
+      if (ev.created_at > (bg.mailSince || 0)) fresh++;
+    }
+    if (fresh && bg.notifications && self.Notification && Notification.permission === 'granted') {
+      await self.registration.showNotification('Walkie-Talkie', {
+        body: 'You have new encrypted messages. Open the app to read them.',
+        tag: 'iwt-mailbox', icon: 'icons/icon-192.png', data: {},
+      });
+    }
+  } finally {
+    db.close();
+  }
+}
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const conv = event.notification.data?.conv;

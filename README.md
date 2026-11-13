@@ -9,6 +9,10 @@ Progressive Web App on GitHub Pages.
 - **CRDT sync.** Conversations are conflict-free replicated data types. Two devices merge their
   histories directly over WebRTC whenever both are online. Concurrent and offline edits
   always converge to the same history.
+- **Bounded storage.** Messages expire after an agreed retention period (1 year for direct chats;
+  chosen per group at creation). Every device deletes them, and history never grows without limit.
+- **Optional mailbox on a relay you run.** Contacts can leave encrypted messages there while
+  you're offline, and an installed app can collect them in the background.
 - **End-to-end encrypted.** Every update is encrypted to each recipient's public key and signed
   by its author. Relays, networks and even group members passing updates along can't read or
   forge anything.
@@ -30,6 +34,11 @@ Progressive Web App on GitHub Pages.
 6. **Safety number** (tap a contact): compare it with your contact in person to rule out a
    swapped link.
 7. **Backup** (Settings): export an encrypted file (PBKDF2 + AES-GCM) to restore on another device.
+8. **Mailbox relays** (Settings, optional): list up to four Nostr relays that *you* run or trust.
+   Your contacts learn them over the encrypted channel or from your contact link. They post
+   encrypted messages there for you when you're offline (kept at most 7 days). Your app collects
+   them when it opens. As an installed Chromium app it also checks in the background and shows a
+   notification with no message content.
 
 ## Architecture
 
@@ -66,6 +75,31 @@ The visible state is a pure function of the op set:
 | `group`  | Signed creation op (seq 1) fixing the member list; the ID commits to creator and nonce |
 | `rename` | Last-writer-wins register on `(lamport, author)` |
 
+#### Expiry (retention)
+
+Every op's *signed header* carries its author's timestamp, which never decreases for a given
+author. Each conversation has one agreed retention period:
+
+- **Direct chats:** a protocol default of 365 days.
+- **Groups:** `retentionDays` inside the signed, pinned group-creation op, so every member applies
+  the same rule.
+
+Pruning works like this:
+
+- Each replica deletes ops older than the cutoff. For each author it keeps the newest expired op
+  as a signed **watermark** and raises that author's *floor* to its seq. Because timestamps are
+  monotonic, the watermark proves every earlier op from that author has expired.
+- Version vectors count from the floor. Peers don't re-request or resend expired history, and the
+  CRDT stays a correct set union (minus expired elements).
+- A peer that was away longer than the retention period receives just the watermark and the live
+  ops. It never gets the expired messages.
+- `group` and `rename` ops are pinned and never expire, so membership and names survive.
+- Ops stamped more than 24 hours in the future are rejected, so a skewed clock can't keep messages
+  alive longer.
+
+Per-user retention settings could be added later on top of this, e.g. a replica that keeps less
+than the agreed period locally.
+
 Sync over a DataChannel works like this:
 1. Each side sends `{t:'sync', convs:{id: vv}}` for the conversations the other peer belongs to.
 2. Each side replies with the ops the other is missing.
@@ -92,6 +126,33 @@ Sync over a DataChannel works like this:
   identity keys, so a man-in-the-middle on signalling can't relay the channel, whatever path the
   SDP took.
 
+### Offline mail and background checks
+
+Public relays only ever receive *ephemeral* events (kind 25050), which they forward but don't
+store. Stored events (kind 4050, with a NIP-40 `expiration` 7 days out) go **only** to the
+recipient's own mailbox relays. The recipient picks those relays and announces them over an
+authenticated channel. They're never sent to the public relay list, and the e2e test asserts the
+public relay saw nothing storable.
+
+When you write to someone who isn't connected:
+
+1. The op goes into a persistent outbox.
+2. It's sealed to the recipient with the same ECIES-plus-signature scheme as signals.
+3. It's posted to their mailbox relays and retried until a relay acknowledges it.
+4. Direct sync clears the outbox entry if you connect first.
+
+Only the author mails their own ops, and the recipient accepts mail only from known peers.
+
+Background checks use **Periodic Background Sync** (installed Chromium PWAs only):
+
+- The browser decides when, typically at most a few times a day depending on engagement. Apps
+  can't agree on exact wake-up times.
+- The service worker decrypts nothing. It copies still-encrypted events from your mailbox relays
+  into IndexedDB and shows "You have new encrypted messages".
+- The app verifies and merges them on next open.
+- There's no Web Push: Google's and Apple's push services reject requests sent from a browser, so
+  push would need a server.
+
 ### Signalling
 
 WebRTC needs a way for peers to swap connection offers. By default the app uses public
@@ -116,13 +177,18 @@ symmetric NATs.
 - **Forward secrecy is partial.** Each op uses a fresh ephemeral key, but it's wrapped to the
   recipient's long-term ECDH key. If a device's keys are compromised, the history addressed to it
   can be decrypted. A double-ratchet layer would fix this.
-- **Group membership is fixed at creation.** Adding or removing members isn't supported yet.
+- **Group membership and retention are fixed at creation.** Changing either isn't supported yet.
+- **Expiry trusts authors' clocks.** An author whose clock runs slow makes their own messages
+  expire early. Clocks more than a day fast are rejected.
+- **Mailbox relays** you list can see when encrypted mail arrives for your inbox topic and how
+  big it is. They can't see the sender, the content or your identity. Use relays you control.
+- **Background checks** happen only in installed Chromium apps, on the browser's schedule.
 - **One device per identity.** Running a restored backup alongside the original device at the same
   time would reuse sequence numbers. Within one browser, a Web Lock lets only one tab run.
 - **Equivocation.** A malicious member could sign two different ops with the same sequence number.
   Each replica keeps the first one it sees.
-- **Both peers must be online at the same time**, unless another member of the conversation passes
-  the updates along.
+- **Both peers must be online at the same time**, unless another member passes the updates along
+  or the recipient has a mailbox relay.
 - **The app is only as trustworthy as the code you first load.** After that, the cached copy keeps
   running, and updates apply only when you accept the "new version" prompt.
 
@@ -131,12 +197,16 @@ symmetric NATs.
 ```bash
 npm install
 npm test               # unit tests: crypto, CRDT convergence, forgery rejection, BIP-340 vectors
-npm run test:e2e       # 3 Chromium users + local relay: relay/manual WebRTC, offline catch-up,
-                       # group gossip, convergence, and running with the web server shut down
+npm run test:e2e       # 3 Chromium users, a "public" relay and a user-owned mailbox relay:
+                       # relay/manual WebRTC, offline catch-up, mailbox delivery while never online
+                       # together, a background Periodic Sync wake-up with notification, group
+                       # gossip, convergence, and running with the web server shut down
 npm run serve          # http://localhost:8080 (undeployed builds use network-first caching)
 ```
 
-The e2e test needs Playwright (`npm i -D playwright && npx playwright install chromium`).
+The e2e test needs Playwright (`npm i -D playwright && npx playwright install chromium`). It uses
+Chromium's full headless mode (`channel: 'chromium'`), because the headless shell can't show
+notifications.
 `node test/relay.mjs` runs a local Nostr relay at `ws://127.0.0.1:7777` for manual testing. Set
 `IWT_DEBUG = true` in the console for network logs.
 

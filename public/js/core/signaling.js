@@ -1,4 +1,4 @@
-// Rendezvous over public Nostr relays.
+// Rendezvous over public Nostr relays, plus optional user-owned mailbox relays.
 //
 // Relays are only used to exchange WebRTC connection offers between two peers
 // who are online at the same time. Every payload is end-to-end encrypted
@@ -7,11 +7,18 @@
 // throwaway Nostr key, so relays cannot link sessions to an identity.
 // Any relay can be swapped out in Settings; the app works with none at all via
 // manual (copy/paste or QR) connection codes.
+//
+// Mailbox relays are different: a user lists relays they run or trust, and only
+// those ever receive *stored* events (MAIL_KIND, NIP-40 expiry). Contacts post
+// encrypted updates there while the owner is offline. Public signalling relays
+// are never sent a stored event and are never asked for one.
 
 import { randomSecret, publicKey, nostrEvent } from './schnorr.js';
 import { hex, sha256, utf8, b64u, randomBytes } from './encoding.js';
 
-export const SIGNAL_KIND = 25050; // 20000–29999 = ephemeral (NIP-16)
+export const SIGNAL_KIND = 25050; // 20000–29999 = ephemeral (NIP-16): forwarded, never stored
+export const MAIL_KIND = 4050;    // 1000–9999 = regular (stored) — only ever sent to mailbox relays
+export const MAIL_TTL_S = 7 * 86400;
 
 export const utcDay = (t = Date.now()) => Math.floor(t / 86400000);
 
@@ -21,9 +28,10 @@ export async function inboxTopic(fp, day = utcDay()) {
 }
 
 class Relay {
-  constructor(pool, url) {
+  constructor(pool, url, mailbox) {
     this.pool = pool;
     this.url = url;
+    this.mailbox = mailbox;
     this.ws = null;
     this.backoff = 1000;
     this.closed = false;
@@ -48,7 +56,10 @@ class Relay {
       let msg;
       try { msg = JSON.parse(m.data); } catch { return; }
       if (!Array.isArray(msg)) return;
-      if (msg[0] === 'EVENT' && msg[1] === this.pool.subId && msg[2]) this.pool._onEvent(msg[2]);
+      if (msg[0] === 'EVENT' && msg[1] === this.pool.subId && msg[2]) this.pool._onEvent(msg[2], this);
+      else if (msg[0] === 'EOSE' && msg[1] === this.pool.subId && this.mailbox) {
+        this.pool.dispatchEvent(new CustomEvent('mailboxsynced', { detail: this.url }));
+      }
     };
     ws.onclose = () => { this.pool._status(); this.retry(); };
     ws.onerror = () => {};
@@ -63,9 +74,10 @@ class Relay {
 
   subscribe() {
     if (!this.open || !this.pool.topics.length) return;
-    this.ws.send(JSON.stringify(['REQ', this.pool.subId, {
-      kinds: [SIGNAL_KIND], '#t': this.pool.topics, since: Math.floor(Date.now() / 1000) - 60,
-    }]));
+    const filters = [{ kinds: [SIGNAL_KIND], '#t': this.pool.topics, since: Math.floor(Date.now() / 1000) - 60 }];
+    // Stored mail is only requested from the user's own mailbox relays.
+    if (this.mailbox) filters.push({ kinds: [MAIL_KIND], '#t': this.pool.mailTopics, since: this.pool.mailSince });
+    this.ws.send(JSON.stringify(['REQ', this.pool.subId, ...filters]));
   }
 
   send(msg) {
@@ -87,21 +99,36 @@ export class RelayPool extends EventTarget {
     this.subId = 'iwt-' + b64u(randomBytes(6));
     this.relays = new Map();
     this.topics = [];
+    this.mailTopics = [];
+    this.mailSince = Math.floor(Date.now() / 1000) - MAIL_TTL_S;
     this.seen = new Set();
   }
 
-  setUrls(urls) {
-    const want = new Set(urls.filter((u) => /^wss?:\/\//.test(u)));
-    for (const [u, r] of this.relays) if (!want.has(u)) { r.close(); this.relays.delete(u); }
-    for (const u of want) if (!this.relays.has(u)) this.relays.set(u, new Relay(this, u));
+  /** @param urls signalling relays  @param mailboxUrls the user's own mailbox relays */
+  setUrls(urls, mailboxUrls = []) {
+    const valid = (u) => /^wss?:\/\//.test(u);
+    const mail = new Set(mailboxUrls.filter(valid));
+    const want = new Set([...urls.filter(valid), ...mail]);
+    for (const [u, r] of this.relays) {
+      if (!want.has(u) || r.mailbox !== mail.has(u)) { r.close(); this.relays.delete(u); }
+    }
+    for (const u of want) if (!this.relays.has(u)) this.relays.set(u, new Relay(this, u, mail.has(u)));
     this._status();
   }
 
-  setTopics(topics) {
+  setTopics(topics, mailTopics = topics, mailSince = this.mailSince) {
     const t = [...new Set(topics)].sort();
-    if (t.join() === this.topics.join()) return;
+    const m = [...new Set(mailTopics)].sort();
+    if (t.join() === this.topics.join() && m.join() === this.mailTopics.join() && mailSince === this.mailSince) return;
     this.topics = t;
+    this.mailTopics = m;
+    this.mailSince = mailSince;
     for (const r of this.relays.values()) r.subscribe();
+  }
+
+  hasMailbox() {
+    for (const r of this.relays.values()) if (r.mailbox && r.open) return true;
+    return false;
   }
 
   async publish(topic, content) {
@@ -114,17 +141,21 @@ export class RelayPool extends EventTarget {
   }
 
   status() {
-    let connected = 0;
-    for (const r of this.relays.values()) if (r.open) connected++;
-    return { connected, total: this.relays.size };
+    let connected = 0, mailbox = 0, mailboxOpen = 0;
+    for (const r of this.relays.values()) {
+      if (r.open) connected++;
+      if (r.mailbox) { mailbox++; if (r.open) mailboxOpen++; }
+    }
+    return { connected, total: this.relays.size, mailbox, mailboxOpen };
   }
 
   _status() {
     this.dispatchEvent(new CustomEvent('status', { detail: this.status() }));
   }
 
-  _onEvent(ev) {
-    if (!ev || typeof ev.id !== 'string' || typeof ev.content !== 'string' || ev.kind !== SIGNAL_KIND) return;
+  _onEvent(ev, relay) {
+    if (!ev || typeof ev.id !== 'string' || typeof ev.content !== 'string') return;
+    if (ev.kind !== SIGNAL_KIND && !(ev.kind === MAIL_KIND && relay?.mailbox)) return;
     if (this.seen.has(ev.id)) return; // same event via several relays, or our own echo
     this.seen.add(ev.id);
     if (this.seen.size > 5000) this.seen = new Set([...this.seen].slice(-2500));
@@ -135,4 +166,29 @@ export class RelayPool extends EventTarget {
     for (const r of this.relays.values()) r.close();
     this.relays.clear();
   }
+}
+
+/**
+ * Store an encrypted mail event on a contact's own mailbox relays. Opens a short-lived
+ * connection to each and resolves with the number of relays that acknowledged it (NIP-20 OK).
+ */
+export async function postMail(urls, topic, content, timeoutMs = 10000) {
+  const secret = randomSecret();
+  const pub = hex(publicKey(secret));
+  const expires = Math.floor(Date.now() / 1000) + MAIL_TTL_S;
+  const ev = await nostrEvent(secret, pub, MAIL_KIND, [['t', topic], ['expiration', String(expires)]], content);
+  const one = (url) => new Promise((resolve) => {
+    let ws, done = false;
+    const finish = (ok) => { if (done) return; done = true; clearTimeout(t); try { ws?.close(); } catch {} resolve(ok); };
+    const t = setTimeout(() => finish(false), timeoutMs);
+    try { ws = new WebSocket(url); } catch { return finish(false); }
+    ws.onopen = () => ws.send(JSON.stringify(['EVENT', ev]));
+    ws.onmessage = (m) => {
+      try { const msg = JSON.parse(m.data); if (msg[0] === 'OK' && msg[1] === ev.id) finish(msg[2] === true); } catch {}
+    };
+    ws.onerror = () => finish(false);
+    ws.onclose = () => finish(false);
+  });
+  const results = await Promise.all(urls.filter((u) => /^wss?:\/\//.test(u)).map(one));
+  return results.filter(Boolean).length;
 }

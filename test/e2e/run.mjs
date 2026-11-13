@@ -1,6 +1,7 @@
 // End-to-end test in real Chromium: three users, relay-signalled and manual WebRTC
-// connections, offline catch-up, group gossip, and running from the service-worker cache
-// with the web server shut down.
+// connections, offline catch-up, store-and-forward through the recipient's own mailbox
+// relay (live and via a background Periodic Sync wake-up), group gossip, and running from
+// the service-worker cache with the web server shut down.
 //
 //   node test/e2e/run.mjs            (SHOTS=dir to save screenshots)
 
@@ -12,20 +13,24 @@ import { startRelay } from '../relay.mjs';
 // Resolved via require so a globally installed Playwright (NODE_PATH) also works.
 const { chromium } = createRequire(import.meta.url)('playwright');
 
-const WEB = 8080, RELAY = 7777;
+const WEB = 8080, RELAY = 7777, MAILBOX = 7778;
+const MAIL_KIND = 4050;
 const URL_ = `http://127.0.0.1:${WEB}/`;
 const SHOTS = process.env.SHOTS;
 
 const step = (s) => console.log('•', s);
 let server = await serve(WEB, { build: 'e2e-' + Date.now() });
-const relay = await startRelay(RELAY);
-const browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+const relay = await startRelay(RELAY);          // stands in for a public relay
+const bobsRelay = await startRelay(MAILBOX);    // a relay Bob runs himself
+// channel 'chromium' = full headless Chromium; the lighter headless shell can't show notifications.
+const browser = await chromium.launch({ channel: 'chromium', args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
 
 const users = [];
-async function newUser(name, { relays = [`ws://127.0.0.1:${RELAY}`] } = {}) {
+async function newUser(name, { relays = [`ws://127.0.0.1:${RELAY}`], mailbox = [] } = {}) {
   const ctx = await browser.newContext({ viewport: { width: 1100, height: 720 } });
-  await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: URL_ });
+  await ctx.grantPermissions(['clipboard-read', 'clipboard-write', 'notifications']);
   if (process.env.IWT_DEBUG) await ctx.addInitScript(() => { globalThis.IWT_DEBUG = true; });
+  await ctx.addInitScript(() => addEventListener('unhandledrejection', (e) => console.error('unhandled rejection:', String(e.reason?.stack || e.reason))));
   const page = await ctx.newPage();
   page.on('pageerror', (e) => console.error(`[${name}] pageerror`, e));
   page.on('console', (m) => { if (m.type() === 'error' || process.env.IWT_DEBUG) console.error(`[${name}]`, m.text()); });
@@ -38,6 +43,8 @@ async function newUser(name, { relays = [`ws://127.0.0.1:${RELAY}`] } = {}) {
   await page.click('#btnSettings');
   await page.fill('textarea[aria-label=Relays]', relays.join('\n'));
   await page.fill('textarea[aria-label="ICE servers"]', '');
+  await page.fill('textarea[aria-label="Mailbox relays"]', mailbox.join('\n'));
+  if (mailbox.length) await page.check('dialog input[type=checkbox]'); // notifications
   await page.click('text=Save settings');
   await page.evaluate(() => navigator.serviceWorker.ready);
   const u = { name, ctx, page };
@@ -51,6 +58,19 @@ const link = (u) => u.page.evaluate(() => {
 });
 
 const fp = (u) => u.page.evaluate(() => window.__iwt.engine.identity.fp);
+
+async function reopen(u) {
+  u.page = await u.ctx.newPage();
+  u.page.on('pageerror', (e) => console.error(`[${u.name}] pageerror`, e));
+  u.page.on('console', (m) => { if (m.type() === 'error' || process.env.IWT_DEBUG) console.error(`[${u.name}]`, m.text()); });
+  await u.page.goto(URL_);
+  await u.page.waitForSelector('#main:not([hidden])');
+}
+
+const until = async (fn, ms = 20000, what = 'condition') => {
+  const end = Date.now() + ms;
+  while (!(await fn())) { if (Date.now() > end) throw new Error('timed out waiting for ' + what); await new Promise((r) => setTimeout(r, 200)); }
+};
 
 async function openChatWith(u, title) {
   await u.page.click('.tabs [data-tab=chats]');
@@ -70,7 +90,7 @@ const shot = async (u, name) => { if (SHOTS) await u.page.screenshot({ path: `${
 try {
   step('create Alice and Bob');
   const alice = await newUser('Alice');
-  const bob = await newUser('Bob');
+  const bob = await newUser('Bob', { mailbox: [`ws://127.0.0.1:${MAILBOX}`] });
 
   step('Bob adds Alice from her link; Alice accepts the request');
   await bob.page.click('#btnAdd');
@@ -103,6 +123,57 @@ try {
   await bob.page.waitForSelector('#main:not([hidden])');
   await openChatWith(bob, 'Alice');
   await expectMsg(bob, 'Written while you were offline', 40000);
+
+  step("never online together: Alice's message waits on Bob's own mailbox relay");
+  await bob.page.close();
+  await alice.page.waitForFunction((f) => !window.__iwt.net.isOnline(f), bobFp, { timeout: 30000 });
+  const mailed = () => bobsRelay.stats.kinds[MAIL_KIND] || 0;
+  let before = mailed();
+  await send(alice, 'Left in your mailbox');
+  await until(() => mailed() > before, 20000, 'mail on Bob\'s relay');
+  await alice.page.close();                     // Alice is gone before Bob returns
+  await reopen(bob);
+  await openChatWith(bob, 'Alice');
+  await expectMsg(bob, 'Left in your mailbox', 20000);
+  const mailWire = bobsRelay.stats.log.join('\n');
+  assert.ok(!mailWire.includes('Left in your mailbox') && !mailWire.includes(aliceFp), 'mailbox relay holds only ciphertext');
+
+  step('background wake-up: the service worker fetches mail while the app is closed and notifies');
+  await bob.page.close();
+  await reopen(alice);
+  await openChatWith(alice, 'Bob');
+  before = mailed();
+  await send(alice, 'Fetched in the background');
+  await until(() => mailed() > before, 20000, 'second mail');
+  await alice.page.close();
+  const blank = await bob.ctx.newPage();        // not same-origin: the app itself stays closed
+  const cdp = await bob.ctx.newCDPSession(blank);
+  const regs = [];
+  cdp.on('ServiceWorker.workerRegistrationUpdated', (e) => regs.push(...e.registrations));
+  await cdp.send('ServiceWorker.enable');
+  await until(() => regs.some((r) => r.scopeURL === URL_), 10000, 'SW registration');
+  const registrationId = regs.find((r) => r.scopeURL === URL_).registrationId;
+  await cdp.send('ServiceWorker.dispatchPeriodicSyncEvent', { origin: URL_.slice(0, -1), registrationId, tag: 'iwt-mailbox' });
+  let bgState;
+  await until(async () => {
+    const sw = bob.ctx.serviceWorkers().find((w) => w.url().startsWith(URL_));
+    if (!sw) return false;
+    bgState = await sw.evaluate(async () => {
+      const db = await new Promise((r) => { const q = indexedDB.open('iwt'); q.onsuccess = () => r(q.result); });
+      const n = await new Promise((r) => { const q = db.transaction('inbox').objectStore('inbox').count(); q.onsuccess = () => r(q.result); });
+      const bg = await new Promise((r) => { const q = db.transaction('kv').objectStore('kv').get('bg'); q.onsuccess = () => r(q.result); });
+      db.close();
+      return { inbox: n, notifications: (await self.registration.getNotifications()).map((x) => x.body), perm: Notification.permission, bg };
+    });
+    return bgState.inbox > 0 && bgState.notifications.length > 0;
+  }, 20000, 'background fetch + notification').catch((e) => { console.error('SW state:', bgState, 'workers:', bob.ctx.serviceWorkers().map((w) => w.url())); throw e; });
+  assert.ok(!bgState.notifications.join().includes('Fetched in the background'), 'notification reveals no content');
+  await blank.close();
+  await reopen(bob);
+  await openChatWith(bob, 'Alice');
+  await expectMsg(bob, 'Fetched in the background', 20000);
+  assert.equal(await bob.page.evaluate(async () => (await window.__iwt.engine.store.all('inbox')).length), 0, 'inbox drained');
+  await reopen(alice);
 
   step('Carol (no relays at all) connects to Alice with manual codes');
   const carol = await newUser('Carol', { relays: [] });
@@ -163,6 +234,7 @@ try {
 
   step('relay saw only opaque, validly signed events (no names, keys, fingerprints or SDP)');
   assert.ok(relay.stats.events > 0 && relay.stats.rejected === 0, 'relay accepted our Schnorr-signed events');
+  assert.deepEqual(Object.keys(relay.stats.kinds), ['25050'], 'public relay only ever saw ephemeral events: nothing to store');
   const wire = relay.stats.log.join('\n');
   for (const needle of ['Alice', 'Bob', aliceFp, bobFp, 'a=fingerprint', 'candidate', 'hello']) {
     assert.ok(!wire.includes(needle), `relay saw "${needle}"`);
@@ -195,5 +267,6 @@ try {
 } finally {
   await browser.close();
   await relay.close();
+  await bobsRelay.close();
   server.close?.();
 }

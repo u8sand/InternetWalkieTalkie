@@ -1,7 +1,9 @@
 // Persistence. Message contents are only ever stored as the encrypted op envelopes;
 // plaintext exists in memory only.
 
-export const STORES = ['kv', 'contacts', 'convs', 'ops', 'requests'];
+// 'inbox' holds raw (still encrypted) mailbox events fetched by the service worker in the background.
+export const STORES = ['kv', 'contacts', 'convs', 'ops', 'requests', 'inbox'];
+export const DB_VERSION = 2;
 
 export class MemoryStore {
   constructor() {
@@ -23,11 +25,16 @@ export class IDBStore {
   open() {
     if (this.db) return Promise.resolve(this);
     return new Promise((resolve, reject) => {
-      const req = indexedDB.open(this.name, 1);
+      const req = indexedDB.open(this.name, DB_VERSION);
       req.onupgradeneeded = () => {
         for (const s of STORES) if (!req.result.objectStoreNames.contains(s)) req.result.createObjectStore(s);
       };
-      req.onsuccess = () => { this.db = req.result; resolve(this); };
+      req.onsuccess = () => {
+        this.db = req.result;
+        // Let a newer tab / the service worker upgrade the schema instead of blocking it.
+        this.db.onversionchange = () => { this.db.close(); this.db = null; };
+        resolve(this);
+      };
       req.onerror = () => reject(req.error);
     });
   }

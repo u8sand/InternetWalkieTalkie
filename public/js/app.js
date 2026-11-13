@@ -1,6 +1,6 @@
 // UI. All user-controlled strings are rendered with textContent — never innerHTML.
 
-import { Engine } from './core/engine.js';
+import { Engine, RETENTION_CHOICES, DEFAULT_RETENTION_DAYS } from './core/engine.js';
 import { IDBStore } from './core/store.js';
 import { Network } from './core/net.js';
 import { importCard, safetyNumber } from './core/crypto.js';
@@ -51,6 +51,13 @@ function avatar(fp, label, online) {
     online !== undefined ? h('span', { class: 'dot ' + (online ? 'ok' : ''), title: online ? 'Online' : 'Offline' }) : null);
 }
 
+function fmtRetention(days) {
+  if (days % 365 === 0) return days === 365 ? '1 year' : `${days / 365} years`;
+  if (days % 30 === 0) return days === 30 ? '1 month' : `${days / 30} months`;
+  if (days % 7 === 0) return days === 7 ? '1 week' : `${days / 7} weeks`;
+  return `${days} day${days === 1 ? '' : 's'}`;
+}
+
 function fmtTime(ts) {
   const d = new Date(ts);
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -84,7 +91,7 @@ async function copy(text, label = 'Copied') {
 
 function myLink() {
   const base = location.origin + location.pathname;
-  return base + '#add=' + b64u(utf8(JSON.stringify(engine.identity.card())));
+  return base + '#add=' + b64u(utf8(JSON.stringify(engine.myLinkPayload())));
 }
 
 /** Accepts an invite link, a bare card code, or raw card JSON. */
@@ -189,21 +196,24 @@ function showNewGroup() {
   const contacts = [...engine.contacts.values()];
   if (!contacts.length) return toast('Add a contact first');
   const name = h('input', { placeholder: 'Group name', maxlength: 80 });
+  const retention = h('select', { 'aria-label': 'Message retention' },
+    RETENTION_CHOICES.map((d) => h('option', { value: String(d), selected: d === DEFAULT_RETENTION_DAYS, text: fmtRetention(d) })));
   const boxes = contacts.map((c) => {
     const cb = h('input', { type: 'checkbox', value: c.fp });
     return h('label', {}, cb, avatar(c.fp, engine.displayName(c.fp)), engine.displayName(c.fp));
   });
   openDialog('New group',
     h('label', {}, 'Name', name),
+    h('label', {}, 'Messages disappear for everyone after', retention),
     h('h3', { text: 'Members' }),
     h('div', { class: 'checklist' }, boxes),
-    h('p', { class: 'muted small', text: 'Members are fixed when the group is created. Any member can pass messages along to the others, so the group syncs even if not everyone is online at once.' }),
+    h('p', { class: 'muted small', text: 'Members and the retention period are fixed when the group is created, so everyone deletes old messages at the same time. Any member can pass messages along to the others, so the group syncs even if not everyone is online at once.' }),
     h('div', { class: 'row end' }, h('button', {
       class: 'primary', text: 'Create group',
       onclick: async () => {
         const fps = boxes.map((b) => b.querySelector('input')).filter((i) => i.checked).map((i) => i.value);
         if (!fps.length) return toast('Pick at least one member');
-        const conv = await engine.createGroup(name.value || 'Group', fps);
+        const conv = await engine.createGroup(name.value || 'Group', fps, Number(retention.value));
         closeDialog();
         render();
         openConv(conv.id);
@@ -324,6 +334,7 @@ function showGroup(convId) {
       if (name.value.trim() && name.value !== view.name) await engine.renameGroup(convId, name.value.trim());
       closeDialog(); render();
     } })),
+    h('p', { class: 'muted small', text: `Messages are deleted for everyone after ${fmtRetention(engine.retentionDays(conv))}. Anyone away longer than that won't receive them.` }),
     h('h3', { text: `Members (${conv.members.length})` }),
     h('ul', { class: 'list' }, conv.members.map((fp) => h('li', {
       onclick: () => fp !== engine.identity.fp && showContact(fp),
@@ -339,6 +350,9 @@ function showSettings() {
   const name = h('input', { value: engine.identity.name, maxlength: 64 });
   const relays = h('textarea', { rows: 4, class: 'mono', 'aria-label': 'Relays' }, (s.relays || []).join('\n'));
   const ice = h('textarea', { rows: 3, class: 'mono', 'aria-label': 'ICE servers' }, (s.iceServers || []).join('\n'));
+  const mailbox = h('textarea', { rows: 2, class: 'mono', 'aria-label': 'Mailbox relays', placeholder: 'wss://relay.example.org' }, (s.mailboxRelays || []).join('\n'));
+  const bgStatus = h('div', { class: 'muted small', text: 'Background checks: …' });
+  backgroundSyncState().then((st) => { bgStatus.textContent = 'Background checks: ' + BG_TEXT[st]; });
   const notif = h('input', { type: 'checkbox', checked: !!s.notifications });
   const pass = h('input', { type: 'password', placeholder: 'Backup passphrase', autocomplete: 'new-password' });
 
@@ -348,6 +362,8 @@ function showSettings() {
     h('div', { class: 'mono', text: engine.identity.fp }),
     h('label', {}, 'Signalling relays (Nostr, one per line). Used only to find peers who are online; they see nothing readable.', relays),
     h('label', {}, 'STUN/TURN servers (one per line). Help connections through NATs. Leave empty for LAN only.', ice),
+    h('label', {}, 'Your mailbox relays (optional, up to 4). Only list Nostr relays you run or trust: contacts store encrypted messages there for you while you are offline, kept for at most 7 days. Public relays above never store anything.', mailbox),
+    bgStatus,
     h('label', { class: 'row' }, notif, h('span', { text: 'Show notifications for new messages' })),
     h('div', { class: 'row end' }, h('button', { class: 'primary', text: 'Save settings', onclick: async () => {
       if (name.value.trim() && name.value !== engine.identity.name) await engine.setName(name.value);
@@ -356,7 +372,10 @@ function showSettings() {
         const p = await Notification.requestPermission();
         if (p !== 'granted') notif.checked = false;
       }
-      await engine.saveSettings({ relays: lines(relays), iceServers: lines(ice), notifications: notif.checked });
+      const mb = lines(mailbox);
+      if (mb.some((u) => !/^wss?:\/\//.test(u))) return toast('Mailbox relays must start with wss://');
+      await engine.saveSettings({ relays: lines(relays), iceServers: lines(ice), mailboxRelays: mb, notifications: notif.checked });
+      setupBackgroundSync();
       toast('Saved'); closeDialog(); render();
     } })),
 
@@ -418,7 +437,8 @@ function renderStatus() {
   const pill = $('statusPill');
   const cls = !online ? 'bad' : r.connected ? 'ok' : 'warn';
   const text = !online ? 'Offline' : r.connected ? `${r.connected}/${r.total} relays · ${peers} peer${peers === 1 ? '' : 's'} online` : (r.total ? 'Connecting to relays…' : `No relays · ${peers} peer${peers === 1 ? '' : 's'}`);
-  pill.replaceChildren(h('span', { class: 'dot ' + cls }), text);
+  const mail = r.mailbox ? ` · mailbox ${r.mailboxOpen ? '✓' : '…'}` : '';
+  pill.replaceChildren(h('span', { class: 'dot ' + cls }), text + mail);
   $('offlineNote').hidden = online;
 }
 
@@ -484,9 +504,7 @@ function renderChat() {
   const box = $('messages');
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const items = [];
-  if (conv.kind === 'direct') {
-    items.push(h('div', { class: 'sysmsg', text: '🔒 Messages are end-to-end encrypted and stored only on your devices.' }));
-  }
+  items.push(h('div', { class: 'sysmsg', text: `🔒 End-to-end encrypted, stored only on members' devices. Messages disappear after ${fmtRetention(engine.retentionDays(conv))}.` }));
   let lastDay = '', lastAuthor = null;
   for (const m of view.list()) {
     const day = fmtDay(m.ts);
@@ -630,6 +648,11 @@ async function startApp() {
   net.addEventListener('peers', scheduleRender);
   net.addEventListener('relays', scheduleRender);
   net.start();
+  setupBackgroundSync();
+  net.addEventListener('synced', (e) => {
+    if (e.detail.via === 'mailbox') toast(`${e.detail.added} message${e.detail.added === 1 ? '' : 's'} picked up from your mailbox`);
+  });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') net.processInbox(); });
   render();
   handleHash();
   addEventListener('hashchange', handleHash);
@@ -637,7 +660,36 @@ async function startApp() {
     if (e.data?.type === 'open-conv' && engine.convs.has(e.data.conv)) openConv(e.data.conv);
   });
   setInterval(scheduleRender, 60000); // refresh relative day labels
+  setInterval(() => engine.prune(), 3600000); // delete messages past their retention
   window.__iwt = { engine, net }; // debugging handle (also used by the e2e test)
+}
+
+// ------------------------------------------------------------------ background mailbox checks
+
+const BG_TEXT = {
+  on: 'on. Your browser decides how often (usually a few times a day).',
+  off: 'off. Add a mailbox relay to enable them.',
+  'needs-install': 'available after you install the app (browser menu → Install).',
+  unsupported: 'not supported in this browser (Chromium-based installed apps only). Messages are fetched when you open the app.',
+};
+
+async function backgroundSyncState() {
+  const reg = await navigator.serviceWorker?.getRegistration();
+  if (!reg || !('periodicSync' in reg)) return 'unsupported';
+  if (!(engine.settings.mailboxRelays || []).length) return 'off';
+  const perm = await navigator.permissions?.query({ name: 'periodic-background-sync' }).catch(() => null);
+  if (perm?.state !== 'granted') return 'needs-install';
+  return (await reg.periodicSync.getTags()).includes('iwt-mailbox') ? 'on' : 'off';
+}
+
+async function setupBackgroundSync() {
+  try {
+    const reg = await navigator.serviceWorker?.ready;
+    if (!reg || !('periodicSync' in reg)) return;
+    if (!(engine.settings.mailboxRelays || []).length) return await reg.periodicSync.unregister('iwt-mailbox');
+    const perm = await navigator.permissions.query({ name: 'periodic-background-sync' });
+    if (perm.state === 'granted') await reg.periodicSync.register('iwt-mailbox', { minInterval: 60 * 60 * 1000 });
+  } catch (e) { console.warn('periodic sync unavailable', e); }
 }
 
 function registerSW() {

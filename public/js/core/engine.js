@@ -6,16 +6,31 @@ import {
   generateIdentity, importIdentity, exportIdentity, importCard, sealOp, openOp, verifyOp,
   isWellFormedOp, encryptBackup, decryptBackup,
 } from './crypto.js';
-import { OpLog, ConversationView, msgId } from './crdt.js';
+import { OpLog, ConversationView, msgId, PINNED_TYPES } from './crdt.js';
 import { utf8, hex, sha256, b64u, randomBytes } from './encoding.js';
 
 export const DEFAULT_SETTINGS = {
   relays: ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net', 'wss://nostr.mom'],
   iceServers: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'],
+  // Relays YOU run or trust to hold encrypted messages for you while you're offline (max 7 days).
+  // Never public relays: those only ever see ephemeral signalling.
+  mailboxRelays: [],
   notifications: false,
 };
 
-const opKey = (env) => env.conv + '|' + env.author + '|' + env.seq;
+const MAX_MAILBOXES = 4;
+const DAY_MS = 86400000;
+// Retention: how long messages live before every member deletes them. Direct chats use the
+// protocol default; groups fix theirs in the signed creation op so all members agree.
+export const DEFAULT_RETENTION_DAYS = 365;
+export const RETENTION_CHOICES = [7, 30, 90, 365, 730];
+export const clampRetention = (d) => (Number.isSafeInteger(d) && d >= 1 && d <= 3650 ? d : DEFAULT_RETENTION_DAYS);
+const MAX_FUTURE_MS = DAY_MS; // tolerated clock skew for op timestamps
+export function cleanRelayList(list) {
+  return [...new Set((Array.isArray(list) ? list : []).filter((u) => typeof u === 'string' && /^wss?:\/\/[^\s]{1,200}$/.test(u)))].slice(0, MAX_MAILBOXES);
+}
+
+export const opKey = (env) => env.conv + '|' + env.author + '|' + env.seq;
 
 export async function directConvId(a, b) {
   const [x, y] = [a, b].sort();
@@ -39,6 +54,11 @@ export class Engine extends EventTarget {
     this.logs = new Map();      // id -> OpLog
     this.views = new Map();     // id -> ConversationView
     this.clock = 0;             // Lamport clock
+    this.mailboxes = new Map(); // fp -> [relay url]: where that peer collects offline mail
+    this.outbox = new Map();    // fp -> Set<opKey>: our ops still to be mailed to that peer
+    this.mailSince = 0;         // unix seconds: newest mailbox event we've processed
+    this.lastTs = 0;            // our ops' timestamps never decrease (expiry watermarks rely on it)
+    this.now = () => Date.now(); // overridable clock (tests)
     this._queue = Promise.resolve();
   }
 
@@ -69,6 +89,9 @@ export class Engine extends EventTarget {
       } catch (e) { console.warn('bad stored contact', e); }
     }
     for (const r of await this.store.all('requests')) this.requests.set(r.fp, r);
+    for (const [fp, list] of Object.entries((await this.store.get('kv', 'mailboxes')) || {})) this.mailboxes.set(fp, list);
+    for (const [fp, keys] of Object.entries((await this.store.get('kv', 'outbox')) || {})) this.outbox.set(fp, new Set(keys));
+    this.mailSince = (await this.store.get('kv', 'mailSince')) || 0;
     for (const conv of await this.store.all('convs')) {
       for (const card of Object.values(conv.memberCards || {})) {
         if (!this.keyring.has(card.fp)) {
@@ -84,9 +107,22 @@ export class Engine extends EventTarget {
       try {
         const body = await openOp(this.identity, env);
         this._applyOp(env, body);
+        if (env.author === this.identity.fp && env.ts > this.lastTs) this.lastTs = env.ts;
       } catch (e) { console.warn('stored op unreadable', e); }
     }
+    await this._prune();
+    await this._saveBackgroundConfig();
     return true;
+  }
+
+  /** Plain, non-secret settings the service worker needs for background mailbox checks. */
+  async _saveBackgroundConfig() {
+    await this.store.put('kv', 'bg', {
+      fp: this.identity.fp,
+      mailboxRelays: this.settings.mailboxRelays || [],
+      notifications: !!this.settings.notifications,
+      mailSince: this.mailSince,
+    });
   }
 
   async createIdentity(name) {
@@ -94,6 +130,7 @@ export class Engine extends EventTarget {
     await this.store.put('kv', 'identity', await exportIdentity(this.identity));
     await this.store.put('kv', 'settings', this.settings);
     this._addKey({ fp: this.identity.fp, name: this.identity.name, signKey: this.identity.signPub, dhKey: this.identity.dhPub, card: this.identity.card() });
+    await this._saveBackgroundConfig();
     return this.identity;
   }
 
@@ -105,8 +142,10 @@ export class Engine extends EventTarget {
   }
 
   async saveSettings(patch) {
+    if (patch.mailboxRelays) patch = { ...patch, mailboxRelays: cleanRelayList(patch.mailboxRelays) };
     this.settings = { ...this.settings, ...patch };
     await this.store.put('kv', 'settings', this.settings);
+    await this._saveBackgroundConfig();
     this._emit('settings', this.settings);
   }
 
@@ -137,8 +176,15 @@ export class Engine extends EventTarget {
     return out;
   }
 
+  /** Card plus where we can be mailed — what a contact link carries. */
+  myLinkPayload() {
+    const m = this.settings.mailboxRelays || [];
+    return m.length ? { ...this.identity.card(), m } : this.identity.card();
+  }
+
   async addContact(card) {
     const k = await importCard(card);
+    if (Array.isArray(card.m)) await this.setPeerMailboxes(k.fp, card.m);
     if (k.fp === this.identity.fp) throw new Error("That's your own card");
     return this._serial(async () => {
       this._addKey(k);
@@ -163,6 +209,55 @@ export class Engine extends EventTarget {
     const c = this.contacts.get(k.fp);
     if (c) { c.card = k.card; await this.store.put('contacts', k.fp, c); }
     this._emit('change', { what: 'contacts' });
+  }
+
+  // ------------------------------------------------------------ offline mail
+
+  /** Record the mailbox relays a peer told us (over an authenticated channel or their link). */
+  async setPeerMailboxes(fp, list) {
+    const clean = cleanRelayList(list);
+    if ((this.mailboxes.get(fp) || []).join() === clean.join()) return;
+    if (clean.length) this.mailboxes.set(fp, clean); else this.mailboxes.delete(fp);
+    await this.store.put('kv', 'mailboxes', Object.fromEntries(this.mailboxes));
+  }
+
+  async queueMail(fp, env) {
+    if (!this.mailboxes.get(fp)?.length) return false;
+    let set = this.outbox.get(fp);
+    if (!set) { set = new Set(); this.outbox.set(fp, set); }
+    set.add(opKey(env));
+    await this._saveOutbox();
+    return true;
+  }
+
+  /** Ops waiting to be mailed to fp (oldest first). */
+  pendingMail(fp) {
+    const out = [];
+    for (const key of this.outbox.get(fp) || []) {
+      const [conv, author, seq] = key.split('|');
+      const env = this.logs.get(conv)?.get(author, Number(seq));
+      if (env) out.push(env);
+    }
+    return out.sort((a, b) => a.lamport - b.lamport);
+  }
+
+  async clearMail(fp, keys) {
+    const set = this.outbox.get(fp);
+    if (!set) return;
+    if (keys) for (const k of keys) set.delete(k); else set.clear();
+    if (!set.size) this.outbox.delete(fp);
+    await this._saveOutbox();
+  }
+
+  _saveOutbox() {
+    return this.store.put('kv', 'outbox', Object.fromEntries([...this.outbox].map(([fp, s]) => [fp, [...s]])));
+  }
+
+  async setMailSince(t) {
+    if (t <= this.mailSince) return;
+    this.mailSince = t;
+    await this.store.put('kv', 'mailSince', t);
+    await this._saveBackgroundConfig();
   }
 
   async setNick(fp, nick) {
@@ -245,7 +340,37 @@ export class Engine extends EventTarget {
     this._emit('change', { what: 'read', conv: convId });
   }
 
-  async createGroup(name, memberFps) {
+  retentionDays(conv) {
+    return conv.kind === 'group' ? clampRetention(conv.retentionDays) : DEFAULT_RETENTION_DAYS;
+  }
+
+  _cutoff(conv) {
+    return this.now() - this.retentionDays(conv) * DAY_MS;
+  }
+
+  /** Delete expired ops everywhere in our replica. Safe to call any time (runs hourly). */
+  prune() {
+    return this._serial(() => this._prune());
+  }
+
+  async _prune() {
+    let changed = false;
+    for (const conv of this.convs.values()) {
+      const log = this.logs.get(conv.id);
+      const view = this.views.get(conv.id);
+      for (const wm of log.expiredHeads(this._cutoff(conv))) {
+        const dropped = log.advanceFloor(wm);
+        for (const e of dropped) await this.store.del('ops', opKey(e));
+        view.remove(log.pinned.has(msgId(wm.author, wm.seq)) ? dropped : [...dropped, wm]);
+        changed = true;
+      }
+    }
+    if (changed) this._emit('change', { what: 'expired' });
+    return changed;
+  }
+
+  async createGroup(name, memberFps, retentionDays = DEFAULT_RETENTION_DAYS) {
+    retentionDays = clampRetention(retentionDays);
     const members = [...new Set([this.identity.fp, ...memberFps])];
     if (members.length < 2) throw new Error('A group needs at least one other member');
     for (const m of members) if (!this.keyring.has(m)) throw new Error('Unknown member ' + m);
@@ -254,12 +379,12 @@ export class Engine extends EventTarget {
       const id = await groupConvId(this.identity.fp, nonce);
       const memberCards = {};
       for (const m of members) memberCards[m] = { fp: m, card: this.keyring.get(m).card };
-      const conv = { id, kind: 'group', members: members.sort(), memberCards, createdBy: this.identity.fp, createdAt: Date.now(), readUpTo: 0 };
+      const conv = { id, kind: 'group', members: members.sort(), memberCards, createdBy: this.identity.fp, createdAt: Date.now(), readUpTo: 0, retentionDays };
       this._registerConv(conv);
       await this.store.put('convs', id, conv);
       await this._send(id, {
         type: 'group', name: name.trim().slice(0, 80) || 'Group', nonce,
-        members: members.map((m) => memberCards[m].card), ts: Date.now(),
+        members: members.map((m) => memberCards[m].card), retentionDays, ts: Date.now(),
       });
       return conv;
     });
@@ -285,8 +410,9 @@ export class Engine extends EventTarget {
     if (!conv) throw new Error('unknown conversation');
     const log = this.logs.get(convId);
     const recipients = conv.members.map((fp) => this.keyring.get(fp)).filter(Boolean);
+    this.lastTs = Math.max(this.now(), this.lastTs);
     const env = await sealOp(this.identity, recipients, {
-      conv: convId, seq: log.nextSeq(this.identity.fp), lamport: this.clock + 1,
+      conv: convId, seq: log.nextSeq(this.identity.fp), lamport: this.clock + 1, ts: this.lastTs,
     }, body);
     await this.store.put('ops', opKey(env), env);
     this._applyOp(env, body);
@@ -296,7 +422,7 @@ export class Engine extends EventTarget {
 
   _applyOp(env, body) {
     const log = this.logs.get(env.conv);
-    if (!log.add(env)) return false;
+    if (!log.add(env, PINNED_TYPES.has(body.type))) return false;
     this.views.get(env.conv).apply(env, body);
     if (env.lamport > this.clock) this.clock = env.lamport;
     return true;
@@ -333,6 +459,7 @@ export class Engine extends EventTarget {
     let conv = this.convs.get(env.conv);
     if (conv && this.logs.get(env.conv).has(env.author, env.seq)) return { added: false, reason: 'duplicate' };
     if (typeof env.keys[me] !== 'string') return { added: false, reason: 'not addressed to us' };
+    if (env.ts > this.now() + MAX_FUTURE_MS) return { added: false, reason: 'timestamp in the future' };
 
     let body;
     try { body = await openOp(this.identity, env); } catch { return { added: false, reason: 'decrypt failed' }; }
@@ -361,6 +488,11 @@ export class Engine extends EventTarget {
     const authorKey = newConv?._keys?.get(env.author) || this.keyring.get(env.author);
     if (!authorKey || !(await verifyOp(env, authorKey.signKey))) return { added: false, reason: 'bad signature' };
 
+    const pinned = PINNED_TYPES.has(body.type);
+    if (!pinned && conv && env.seq <= this.logs.get(conv.id).floor(env.author)) return { added: false, reason: 'expired' };
+    // An expired op is still useful: it is a signed watermark that lets us skip that author's older history.
+    const expired = !pinned && env.ts <= this._cutoff(c);
+
     if (newConv) {
       const keys = newConv._keys;
       delete newConv._keys;
@@ -370,6 +502,10 @@ export class Engine extends EventTarget {
     }
     await this.store.put('ops', opKey(env), env);
     this._applyOp(env, body);
+    if (expired) {
+      await this._prune();
+      return { added: true, expired: true };
+    }
     this._emit('op', { env, body, conv: env.conv, source, local: false });
     if (newConv) this._emit('change', { what: 'convs' });
     return { added: true };
@@ -390,6 +526,7 @@ export class Engine extends EventTarget {
     return {
       id: env.conv, kind: 'group', members: [...keys.keys()].sort(), memberCards,
       createdBy: env.author, createdAt: Date.now(), readUpTo: 0, _keys: keys,
+      retentionDays: clampRetention(body.retentionDays),
     };
   }
 
@@ -402,6 +539,7 @@ export class Engine extends EventTarget {
       contacts: [...this.contacts.values()],
       convs: [...this.convs.values()],
       ops: [...this.logs.values()].flatMap((l) => l.since({})),
+      mailboxes: Object.fromEntries(this.mailboxes),
       exportedAt: Date.now(),
     };
     return encryptBackup(payload, passphrase);
@@ -416,6 +554,7 @@ export class Engine extends EventTarget {
     for (const c of data.contacts || []) await this.store.put('contacts', c.fp, c);
     for (const c of data.convs || []) await this.store.put('convs', c.id, c);
     for (const env of data.ops || []) await this.store.put('ops', opKey(env), env);
+    if (data.mailboxes) await this.store.put('kv', 'mailboxes', data.mailboxes);
   }
 
   async wipe() {

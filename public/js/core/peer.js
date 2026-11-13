@@ -93,7 +93,7 @@ export class Peer extends EventTarget {
     dc.onopen = () => {
       if (this.helloSent) return;
       this.helloSent = true;
-      this._send({ t: 'hi', card: this.engine.identity.card(), nonce: this.nonce });
+      this._send({ t: 'hi', card: this.engine.identity.card(), nonce: this.nonce, mb: this.engine.settings.mailboxRelays || [] });
     };
     dc.onclose = () => this.close();
     dc.onmessage = (e) => this._onMessage(e.data).catch((err) => {
@@ -129,6 +129,7 @@ export class Peer extends EventTarget {
       if (!this.manual && !this.engine.knownPeers().has(k.fp)) return this.close();
       this.remote = k;
       this.remoteNonce = String(msg.nonce || '');
+      this.remoteMailboxes = Array.isArray(msg.mb) ? msg.mb : [];
       const local = dtlsFingerprint(this.pc.localDescription?.sdp);
       const remote = dtlsFingerprint(this.pc.remoteDescription?.sdp);
       const sig = await sign(this.engine.identity, authTranscript(this.remoteNonce, local, remote));
