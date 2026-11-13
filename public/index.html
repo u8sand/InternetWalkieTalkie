@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss: ws:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#0f172a">
+  <meta name="description" content="Serverless, end-to-end encrypted, peer-to-peer messenger.">
+  <title>Walkie-Talkie</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/app.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <noscript>This app needs JavaScript.</noscript>
+
+  <div id="loading" class="center-screen"><div class="spinner" aria-label="Loading"></div></div>
+
+  <section id="locked" class="center-screen" hidden>
+    <div class="card narrow">
+      <h1>Already open</h1>
+      <p>Walkie-Talkie is open in another tab or window. Only one copy can run at a time so your message history stays consistent.</p>
+      <button id="lockedRetry" class="primary">Use it here instead</button>
+    </div>
+  </section>
+
+  <section id="onboard" class="center-screen" hidden>
+    <form id="onboardForm" class="card narrow">
+      <img src="icons/icon.svg" alt="" class="logo">
+      <h1>Walkie-Talkie</h1>
+      <p class="muted">Private messaging with no servers and no accounts. Your identity is a key pair created on this device. Messages are encrypted end to end and sync directly between devices when both are online.</p>
+      <label>Display name
+        <input id="onboardName" required maxlength="64" autocomplete="nickname" placeholder="e.g. Sam">
+      </label>
+      <button class="primary" type="submit">Create my identity</button>
+      <button type="button" id="onboardRestore" class="link">Restore from a backup file</button>
+    </form>
+  </section>
+
+  <div id="main" hidden>
+    <aside id="sidebar">
+      <header class="bar">
+        <div class="me">
+          <img src="icons/icon.svg" alt="" class="logo-sm">
+          <div>
+            <div id="myName" class="strong"></div>
+            <button id="statusPill" class="pill" title="Network status"></button>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="btnAdd" class="icon" title="Add contact" aria-label="Add contact">＋</button>
+          <button id="btnGroup" class="icon" title="New group" aria-label="New group">👥</button>
+          <button id="btnSettings" class="icon" title="Settings" aria-label="Settings">⚙</button>
+        </div>
+      </header>
+      <nav class="tabs" role="tablist">
+        <button role="tab" data-tab="chats" class="active">Chats</button>
+        <button role="tab" data-tab="contacts">Contacts <span id="reqBadge" class="badge" hidden></span></button>
+      </nav>
+      <ul id="convList" class="list"></ul>
+      <ul id="contactList" class="list" hidden></ul>
+      <div id="offlineNote" class="note" hidden>You're offline. Running from this device's cache — messages you write are saved and will sync later.</div>
+    </aside>
+
+    <main id="chat">
+      <div id="chatEmpty" class="center-screen muted">
+        <div>
+          <p>Select a conversation, or add a contact to get started.</p>
+        </div>
+      </div>
+      <header id="chatHeader" class="bar" hidden>
+        <button id="btnBack" class="icon back" aria-label="Back">‹</button>
+        <button id="chatTitleBtn" class="chat-title">
+          <span id="chatTitle" class="strong"></span>
+          <span id="chatSub" class="muted small"></span>
+        </button>
+      </header>
+      <div id="messages" hidden></div>
+      <form id="composer" hidden>
+        <textarea id="composerInput" rows="1" placeholder="Message" maxlength="20000" aria-label="Message"></textarea>
+        <button class="primary" type="submit" aria-label="Send">Send</button>
+      </form>
+    </main>
+  </div>
+
+  <dialog id="dialog"><div id="dialogBody"></div></dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

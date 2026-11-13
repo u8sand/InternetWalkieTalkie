@@ -1,0 +1,16 @@
+{
+  "name": "internet-walkie-talkie",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serverless, end-to-end encrypted, CRDT-synced peer-to-peer messenger PWA",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/unit/*.test.mjs",
+    "test:e2e": "node test/e2e/run.mjs",
+    "serve": "node test/serve.mjs"
+  },
+  "devDependencies": {
+    "@noble/curves": "^1.9.0",
+    "ws": "^8.18.0"
+  }
+}
