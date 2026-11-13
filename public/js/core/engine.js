@@ -10,6 +10,8 @@ import { OpLog, ConversationView, msgId, streamOf, PINNED_TYPES } from './crdt.j
 import { utf8, hex, sha256, b64u, randomBytes } from './encoding.js';
 
 const newDeviceId = () => hex(randomBytes(8));
+const newInvite = () => ({ token: b64u(randomBytes(16)), at: Date.now() });
+const INVITE_RE = /^[A-Za-z0-9_-]{16,43}$/;
 
 export const DEFAULT_SETTINGS = {
   relays: ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net', 'wss://nostr.mom'],
@@ -63,6 +65,7 @@ export class Engine extends EventTarget {
     this.lastTs = 0;            // this device's op timestamps never decrease (expiry watermarks rely on it)
     this.removed = {};          // fp -> ms: contact removals, merged across our own devices
     this.nameAt = 0;            // when our display name last changed (merged across our devices)
+    this.invite = null;         // {token, at}: secret in our contact link; whoever presents it is auto-accepted
     this.now = () => Date.now(); // overridable clock (tests)
     this._queue = Promise.resolve();
   }
@@ -87,6 +90,7 @@ export class Engine extends EventTarget {
     this.device = await this._deviceId();
     this.removed = (await this.store.get('kv', 'removed')) || {};
     this.nameAt = (await this.store.get('kv', 'nameAt')) || 0;
+    this.invite = await this._loadInvite();
     this.settings = { ...DEFAULT_SETTINGS, ...((await this.store.get('kv', 'settings')) || {}) };
     this._addKey({ fp: this.identity.fp, name: this.identity.name, signKey: this.identity.signPub, dhKey: this.identity.dhPub, card: this.identity.card() });
 
@@ -140,9 +144,27 @@ export class Engine extends EventTarget {
     return d;
   }
 
+  async _loadInvite() {
+    let inv = await this.store.get('kv', 'invite');
+    if (!inv) { inv = newInvite(); await this.store.put('kv', 'invite', inv); }
+    return inv;
+  }
+
+  /** Invalidate every contact link shared so far; old links fall back to contact requests. */
+  async resetInvite() {
+    this.invite = newInvite();
+    await this.store.put('kv', 'invite', this.invite);
+    this._emit('change', { what: 'invite' });
+  }
+
+  checkInvite(token) {
+    return typeof token === 'string' && !!this.invite && token === this.invite.token;
+  }
+
   async createIdentity(name) {
     this.identity = await generateIdentity(name.trim().slice(0, 64) || 'Anonymous');
     this.device = await this._deviceId();
+    this.invite = await this._loadInvite();
     await this.store.put('kv', 'identity', await exportIdentity(this.identity));
     await this.store.put('kv', 'settings', this.settings);
     this._addKey({ fp: this.identity.fp, name: this.identity.name, signKey: this.identity.signPub, dhKey: this.identity.dhPub, card: this.identity.card() });
@@ -194,13 +216,17 @@ export class Engine extends EventTarget {
     return out;
   }
 
-  /** Card plus where we can be mailed — what a contact link carries. */
+  /**
+   * What a contact link carries: our public card, where we can be mailed, and our invite
+   * token. Presenting the token proves the person got the link from us, so we accept them
+   * without a request.
+   */
   myLinkPayload() {
     const m = this.settings.mailboxRelays || [];
-    return m.length ? { ...this.identity.card(), m } : this.identity.card();
+    return { ...this.identity.card(), ...(m.length ? { m } : {}), i: this.invite.token };
   }
 
-  async addContact(card, { addedAt = Date.now(), nick, nickAt } = {}) {
+  async addContact(card, { addedAt = Date.now(), nick, nickAt, via } = {}) {
     const k = await importCard(card);
     if (k.fp === this.identity.fp) throw new Error("That's your own card");
     if (Array.isArray(card.m)) await this.setPeerMailboxes(k.fp, card.m);
@@ -210,13 +236,15 @@ export class Engine extends EventTarget {
       const c = {
         fp: k.fp, card: k.card, addedAt: existing?.addedAt || addedAt,
         nick: existing?.nick || nick || '', nickAt: existing?.nickAt || nickAt || 0,
+        // Their invite token, presented until we've connected once so they auto-accept us.
+        invite: existing?.invite || (typeof card.i === 'string' && INVITE_RE.test(card.i) ? card.i : undefined),
       };
       if (this.removed[k.fp]) { delete this.removed[k.fp]; await this.store.put('kv', 'removed', this.removed); }
       this.contacts.set(k.fp, c);
       await this.store.put('contacts', k.fp, c);
       if (this.requests.delete(k.fp)) await this.store.del('requests', k.fp);
       await this._ensureDirectConv(k.fp);
-      this._emit('change', { what: 'contacts' });
+      this._emit('change', { what: 'contacts', fp: k.fp, added: !existing, via });
       return c;
     });
   }
@@ -280,6 +308,14 @@ export class Engine extends EventTarget {
     this.mailSince = t;
     await this.store.put('kv', 'mailSince', t);
     await this._saveBackgroundConfig();
+  }
+
+  /** They know us now (we connected), so stop presenting their invite token. */
+  async clearInvite(fp) {
+    const c = this.contacts.get(fp);
+    if (!c?.invite) return;
+    delete c.invite;
+    await this.store.put('contacts', fp, c);
   }
 
   async setNick(fp, nick, at = Date.now()) {
@@ -579,6 +615,7 @@ export class Engine extends EventTarget {
       ops: [...this.logs.values()].flatMap((l) => l.since({})),
       mailboxes: Object.fromEntries(this.mailboxes),
       mailSince: this.mailSince,
+      invite: this.invite,
       exportedAt: Date.now(),
     };
   }
@@ -602,6 +639,7 @@ export class Engine extends EventTarget {
     if (data.removed) await this.store.put('kv', 'removed', data.removed);
     if (data.nameAt) await this.store.put('kv', 'nameAt', data.nameAt);
     if (data.mailSince) await this.store.put('kv', 'mailSince', data.mailSince);
+    if (data.invite) await this.store.put('kv', 'invite', data.invite);
   }
 
   async exportBackup(passphrase) {
@@ -621,6 +659,7 @@ export class Engine extends EventTarget {
       contacts: [...this.contacts.values()].map(({ card, nick, nickAt, addedAt }) => ({ card, nick, nickAt, addedAt })),
       removed: this.removed,
       mailboxes: Object.fromEntries(this.mailboxes),
+      invite: this.invite, // links shared from any of our devices work on all of them
     };
   }
 
@@ -628,6 +667,10 @@ export class Engine extends EventTarget {
   async mergeOwnDevice(sum) {
     if (!sum || typeof sum !== 'object') return;
     if (typeof sum.name === 'string' && Number(sum.nameAt) > this.nameAt) await this.setName(sum.name, Number(sum.nameAt));
+    if (sum.invite && INVITE_RE.test(sum.invite.token) && Number(sum.invite.at) > (this.invite?.at || 0)) {
+      this.invite = { token: sum.invite.token, at: Number(sum.invite.at) };
+      await this.store.put('kv', 'invite', this.invite);
+    }
     for (const [fp, at] of Object.entries(sum.removed || {})) {
       const c = this.contacts.get(fp);
       if (c && Number(at) > (c.addedAt || 0)) await this.removeContact(fp, Number(at));

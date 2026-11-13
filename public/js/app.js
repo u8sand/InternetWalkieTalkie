@@ -167,29 +167,52 @@ async function addContactFromText(text) {
   openConv(conv.id);
 }
 
+function shareText(link) {
+  return `Let's chat privately on Walkie-Talkie (end-to-end encrypted, no accounts). Open this link to add me as ${engine.identity.name}: ${link}`;
+}
+
+async function shareMyLink() {
+  const link = myLink();
+  if (navigator.share) {
+    try { await navigator.share({ title: 'Chat with me on Walkie-Talkie', text: shareText(link).replace(link, '').trim(), url: link }); return; } catch (e) { if (e.name === 'AbortError') return; }
+  }
+  copy(shareText(link), 'Invite message copied: paste it anywhere');
+}
+
 function showAddContact(prefill = '') {
   const link = myLink();
-  const input = h('textarea', { class: 'codebox', placeholder: 'Paste a contact link here', 'aria-label': 'Contact link' });
+  const input = h('textarea', { class: 'codebox', placeholder: 'Paste their link here', 'aria-label': 'Contact link' });
   input.value = prefill;
   const err = h('div', { class: 'small', style: 'color:var(--bad)' });
   const add = async () => {
     try { await addContactFromText(input.value); } catch (e) { err.textContent = e.message; }
   };
-  openDialog('Add contact',
-    h('h3', { text: 'Your contact link' }),
-    h('p', { class: 'muted small', text: 'Share this with people you want to talk to. It contains only your public keys.' }),
-    qrCanvas(link),
-    h('div', { class: 'row' },
-      h('input', { readonly: true, value: link, class: 'grow mono', onfocus: (e) => e.target.select(), 'aria-label': 'Your link' }),
-      h('button', { text: 'Copy', onclick: () => copy(link, 'Link copied') }),
-      navigator.share ? h('button', { text: 'Share', onclick: () => navigator.share({ title: 'Message me on Walkie-Talkie', url: link }).catch(() => {}) }) : null),
+  openDialog('Connect with someone',
+    h('h3', { text: 'Invite someone' }),
+    h('p', { class: 'muted small', text: 'Send them your link, or let them scan this code with their phone camera. Whoever opens it is added as your contact automatically, with nothing to approve.' }),
+    h('button', { class: 'qr-btn', title: 'Show larger', 'aria-label': 'Show QR code larger', onclick: () => showBigQR(link) }, qrCanvas(link)),
+    h('div', { class: 'row share-row' },
+      h('button', { class: 'primary grow', text: navigator.share ? 'Share link…' : 'Copy invite message', onclick: shareMyLink }),
+      h('button', { class: 'grow', text: 'Copy link', onclick: () => copy(link, 'Link copied') })),
+    h('details', { class: 'small muted' }, h('summary', { text: 'Show link' }),
+      h('input', { readonly: true, value: link, class: 'mono', onfocus: (e) => e.target.select(), 'aria-label': 'Your link' })),
     h('div', { class: 'section' },
-      h('h3', { text: "Add someone else's link" }),
+      h('h3', { text: 'Got someone\'s link or QR code?' }),
+      h('p', { class: 'muted small', text: 'Just open their link, or scan their code with your camera app. Or paste it here:' }),
       input, err,
       h('div', { class: 'row end', style: 'margin-top:.5em' },
         scanButton((t) => { input.value = t; add(); }),
         h('button', { class: 'primary', text: 'Add contact', onclick: add }))),
-    h('p', { class: 'muted small' }, 'No internet or relays? Use ', h('button', { class: 'link', text: 'direct connection codes', onclick: showManual }), ' instead.'),
+    h('p', { class: 'muted small' }, 'Together without internet? Use ', h('button', { class: 'link', text: 'direct connection codes', onclick: showManual }), '.'),
+  );
+}
+
+/** Full-screen QR for someone else to scan off your screen. */
+function showBigQR(link) {
+  openDialog('Scan to add ' + engine.identity.name,
+    h('div', { class: 'big-qr' }, qrCanvas(link)),
+    h('p', { class: 'muted small center', text: 'Point a phone camera at this code. It opens Walkie-Talkie and adds you.' }),
+    h('div', { class: 'row end' }, h('button', { text: 'Back', onclick: () => showAddContact() })),
   );
 }
 
@@ -388,6 +411,15 @@ function showSettings() {
       h('button', { text: 'Link a new device…', onclick: showLinkHost })),
 
     h('div', { class: 'section' },
+      h('h3', { text: 'Your contact link' }),
+      h('p', { class: 'muted small', text: 'Anyone who opens your link is added automatically. If it ended up somewhere it shouldn\'t, reset it: old links will only send you contact requests.' }),
+      h('button', { text: 'Reset my contact link', onclick: async () => {
+        if (!confirm('Make a new contact link? People using your old link will need you to accept their request.')) return;
+        await engine.resetInvite();
+        toast('Your contact link was reset');
+      } })),
+
+    h('div', { class: 'section' },
       h('h3', { text: 'Connect without relays' }),
       h('button', { text: 'Direct connection codes…', onclick: showManual })),
 
@@ -537,7 +569,7 @@ function renderLists() {
       h('div', { class: 'info' },
         h('div', { class: 'title' }, h('span', { text: title }), last ? h('span', { class: 'muted small', text: fmtTime(last.ts) }) : null),
         h('div', { class: 'row' }, h('div', { class: 'preview grow', text: preview }), unread ? h('span', { class: 'badge', text: String(unread) }) : null)));
-  }) : [h('li', { class: 'empty' }, h('p', { text: 'No conversations yet.' }), h('button', { class: 'primary', text: 'Add a contact', onclick: () => showAddContact() }))]));
+  }) : [h('li', { class: 'empty' }, h('p', { text: 'No conversations yet. Invite someone to start chatting.' }), h('button', { class: 'primary', text: 'Invite someone', onclick: () => showAddContact() }), h('button', { class: 'link', text: 'Share my link', onclick: shareMyLink }))]));
 
   // Contacts + requests
   const reqs = [...engine.requests.values()];
@@ -556,7 +588,7 @@ function renderLists() {
       avatar(c.fp, engine.displayName(c.fp), net.isOnline(c.fp)),
       h('div', { class: 'info' },
         h('div', { class: 'title' }, h('span', { text: engine.displayName(c.fp) })),
-        h('div', { class: 'preview', text: net.isOnline(c.fp) ? 'Online' : 'Offline' })))) : (reqs.length ? [] : [h('li', { class: 'empty' }, h('p', { text: 'No contacts yet.' }), h('button', { class: 'primary', text: 'Add a contact', onclick: () => showAddContact() }))])),
+        h('div', { class: 'preview', text: net.isOnline(c.fp) ? 'Online' : 'Offline' })))) : (reqs.length ? [] : [h('li', { class: 'empty' }, h('p', { text: 'No contacts yet.' }), h('button', { class: 'primary', text: 'Invite someone', onclick: () => showAddContact() }))])),
   );
 
   const totalUnread = convs.reduce((n, c) => n + c.unread, 0);
@@ -707,12 +739,15 @@ function handleHash() {
         const conv = await engine.directConv(k.fp);
         return openConv(conv.id);
       }
-      openDialog('Add contact?',
-        h('div', { class: 'row' }, avatar(k.fp, k.name), h('div', {}, h('div', { class: 'strong', text: k.name || '(no name)' }), h('div', { class: 'mono small', text: k.fp }))),
-        h('p', { class: 'muted small', text: 'Once added, you will connect automatically whenever you are both online.' }),
+      const name = k.name || 'Someone';
+      openDialog(`${name} invited you to chat`,
+        h('div', { class: 'row' }, avatar(k.fp, k.name), h('div', {}, h('div', { class: 'strong', text: name }), h('div', { class: 'mono small', text: k.fp }))),
+        h('p', { class: 'muted small', text: card.i
+          ? `You'll be connected to ${name} straight away. You can chat whenever you're both online${card.m ? ', or leave messages in their mailbox' : ''}.`
+          : `${name} will get a contact request. Once they accept, you can chat whenever you're both online.` }),
         h('div', { class: 'row end' },
-          h('button', { text: 'Cancel', onclick: closeDialog }),
-          h('button', { class: 'primary', text: 'Add contact', onclick: () => addContactFromText(code).catch((e) => toast(e.message)) })));
+          h('button', { text: 'Not now', onclick: closeDialog }),
+          h('button', { class: 'primary', text: `Add ${name}`, onclick: () => addContactFromText(code).catch((e) => toast(e.message)) })));
     } catch { toast('Invalid contact link'); }
   })();
 }
@@ -731,6 +766,11 @@ async function startApp() {
   });
   engine.addEventListener('settings', scheduleRender);
   net.addEventListener('peers', scheduleRender);
+  net.addEventListener('invited', async (e) => {
+    const conv = await engine.directConv(e.detail.fp);
+    toast(`${engine.displayName(e.detail.fp)} added you from your link`, { label: 'Say hi', run: () => openConv(conv.id) });
+    notify(conv.id, { author: e.detail.fp }, { type: 'msg', text: 'Added you as a contact' });
+  });
   net.addEventListener('relays', scheduleRender);
   net.start();
   setupBackgroundSync();
@@ -813,10 +853,25 @@ async function boot() {
     e.preventDefault();
     e.submitter && (e.submitter.disabled = true);
     await engine.createIdentity($('onboardName').value);
-    startApp();
+    // Came here through someone's invite link: connect to them right away.
+    const invite = /^#add=([A-Za-z0-9_-]+)/.exec(location.hash)?.[1];
+    if (invite) history.replaceState(null, '', location.pathname + location.search);
+    await startApp();
+    if (invite) addContactFromText(invite).catch((err) => toast(err.message));
   };
   $('onboardRestore').onclick = showRestore;
   $('onboardLink').onclick = () => showLinkJoin();
+  // Opened someone's contact link without an identity yet: say who invited them. The hash
+  // stays in place and is handled once the identity exists.
+  const inv = /^#add=([A-Za-z0-9_-]+)/.exec(location.hash);
+  if (inv) {
+    try {
+      const card = JSON.parse(fromUtf8(fromB64u(inv[1])));
+      const name = (typeof card.n === 'string' && card.n.slice(0, 64)) || 'Someone';
+      $('onboardInvite').textContent = `${name} invited you to chat. Choose a display name to get started. You'll be connected right after.`;
+      $('onboardInvite').hidden = false;
+    } catch {}
+  }
   // Opened by scanning the link QR code with this device's camera.
   const m = /^#link=([A-Za-z0-9_-]+)/.exec(location.hash);
   if (m) { history.replaceState(null, '', location.pathname + location.search); showLinkJoin(m[1]); }

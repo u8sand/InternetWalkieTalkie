@@ -1,7 +1,8 @@
 // One WebRTC DataChannel to one peer, plus the authentication handshake and the
 // CRDT sync protocol that runs over it.
 //
-// Handshake: both sides send {t:'hi', card, dev, nonce}; then each signs
+// Handshake: the channel's creator sends {t:'hi', card, dev, nonce} and the other side
+// replies with its own (never first: see _setup); then each signs
 //   "iwt-auth-v1|<peer nonce>|<own DTLS fingerprint>|<peer DTLS fingerprint>"
 // with its identity key. Binding the DTLS fingerprints proves no one is relaying
 // the channel in the middle, whatever path the offer/answer took.
@@ -99,11 +100,10 @@ export class Peer extends EventTarget {
   _setup(dc) {
     this.dc = dc;
     dc.bufferedAmountLowThreshold = 256 * 1024;
-    dc.onopen = () => {
-      if (this.helloSent) return;
-      this.helloSent = true;
-      this._send({ t: 'hi', card: this.engine.identity.card(), dev: this.engine.device, nonce: this.nonce, mb: this.engine.settings.mailboxRelays || [] });
-    };
+    // Only the side that created the channel speaks first. The answering side's channel can
+    // report "open" before the initiator's does, and Chromium may drop a message that lands
+    // in that window — so the answerer sends its hi only in reply to the initiator's.
+    dc.onopen = () => { if (this.initiator) this._sendHi(); };
     dc.onclose = () => this.close();
     // Handle messages strictly in order (e.g. an address-book merge must finish before the
     // ops that depend on it are ingested).
@@ -111,6 +111,12 @@ export class Peer extends EventTarget {
       this._rx = this._rx.then(() => this._onMessage(e.data)).catch((err) => console.warn('peer message error', err));
     };
     if (dc.readyState === 'open') dc.onopen();
+  }
+
+  _sendHi() {
+    if (this.helloSent) return;
+    this.helloSent = true;
+    this._send({ t: 'hi', card: this.engine.identity.card(), dev: this.engine.device, nonce: this.nonce, mb: this.engine.settings.mailboxRelays || [] });
   }
 
   _send(obj) {
@@ -133,6 +139,7 @@ export class Peer extends EventTarget {
 
     if (msg.t === 'hi') {
       if (this.remote) return;
+      this._sendHi(); // answerer: reply now that both ends are open
       let k;
       try { k = await importCard(msg.card); } catch { return this.close(); }
       const dev = String(msg.dev || '');

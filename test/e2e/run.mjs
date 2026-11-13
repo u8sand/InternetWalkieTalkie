@@ -47,16 +47,20 @@ async function newUser(name, { relays = [`ws://127.0.0.1:${RELAY}`], mailbox = [
   await page.fill('textarea[aria-label="Mailbox relays"]', mailbox.join('\n'));
   if (mailbox.length) await page.check('dialog input[type=checkbox]'); // notifications
   await page.click('text=Save settings');
+  await page.waitForFunction(() => !document.getElementById('dialog').open); // save handler finished
   await page.evaluate(() => navigator.serviceWorker.ready);
   const u = { name, ctx, page };
   users.push(u);
   return u;
 }
 
-const link = (u) => u.page.evaluate(() => {
-  const card = window.__iwt.engine.identity.card();
-  return location.origin + location.pathname + '#add=' + btoa(JSON.stringify(card)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-});
+/** The contact link exactly as the "Invite someone" screen shows it. */
+async function link(u) {
+  await u.page.click('#btnAdd');
+  const url = await u.page.inputValue('input[aria-label="Your link"]');
+  await u.page.click('dialog button[aria-label=Close]');
+  return url;
+}
 
 const fp = (u) => u.page.evaluate(() => window.__iwt.engine.identity.fp);
 
@@ -95,20 +99,23 @@ try {
   const alice = await newUser('Alice');
   const bob = await newUser('Bob', { mailbox: [`ws://127.0.0.1:${MAILBOX}`] });
 
-  step('Bob adds Alice from her link; Alice accepts the request');
-  await bob.page.click('#btnAdd');
-  await bob.page.fill('textarea[aria-label="Contact link"]', await link(alice));
-  await bob.page.click('dialog button.primary:has-text("Add contact")');
-  await alice.page.waitForSelector('#reqBadge:not([hidden])', { timeout: 30000 });
-  await alice.page.click('.tabs [data-tab=contacts]');
-  await shot(alice, '1-request');
-  await alice.page.click('#contactList li.request >> text=Accept');
+  step("Bob opens the link Alice shared; they're connected, nothing to approve");
+  await alice.page.click('#btnAdd');
+  await shot(alice, '1-invite');
+  await alice.page.click('dialog button[aria-label=Close]');
+  const aliceLink = await link(alice);
+  await bob.page.goto(aliceLink);
+  await bob.page.waitForSelector('#main:not([hidden])');
+  await bob.page.click('dialog button.primary:has-text("Add Alice")');
+  await alice.page.waitForSelector('#toast:has-text("Bob added you from your link")', { timeout: 30000 });
+  assert.equal(await alice.page.evaluate(() => window.__iwt.engine.requests.size), 0, 'no request to accept');
 
   step('they connect over WebRTC via the relay');
   const bobFp = await fp(bob), aliceFp = await fp(alice);
-  await alice.page.waitForFunction((f) => window.__iwt.net.isOnline(f), bobFp, { timeout: 30000 });
-  await bob.page.waitForFunction((f) => window.__iwt.net.isOnline(f), aliceFp, { timeout: 30000 });
+  await alice.page.waitForFunction((f) => window.__iwt.net.isOnline(f), bobFp, { timeout: 45000 });
+  await bob.page.waitForFunction((f) => window.__iwt.net.isOnline(f), aliceFp, { timeout: 45000 });
 
+  if (process.env.E2E_STOP === 'connect') throw Object.assign(new Error('stopped early (E2E_STOP)'), { early: true });
   step('messages flow both ways');
   await send(bob, 'Hi Alice, it is Bob 👋');
   await openChatWith(alice, 'Bob');
@@ -200,6 +207,9 @@ try {
   await alice.page.waitForFunction(() => document.querySelector('#convList')?.textContent.includes('Hello from Carol'), null, { timeout: 15000 });
 
   step('Alice makes a group; Carol and Bob never met, but sync through Alice');
+  // Relaying through Alice needs her connected to both (Bob and Alice just reopened their apps).
+  await alice.page.waitForFunction((f) => window.__iwt.net.isOnline(f), bobFp, { timeout: 45000 })
+    .catch(() => { throw new Error('Alice and Bob did not reconnect within 45s of reopening'); });
   await alice.page.click('#btnGroup');
   await alice.page.fill('dialog input[placeholder="Group name"]', 'Walkie crew');
   await alice.page.check(`dialog input[value="${bobFp}"]`);
@@ -265,6 +275,36 @@ try {
   assert.deepEqual(hc, hp);
   assert.equal(ha.length, 4);
 
+  step('a brand-new person opens Alice\'s link: setup says who invited them, then they\'re connected');
+  const daveCtx = await browser.newContext({ ...devices['iPhone 13'] });
+  const dave = { name: 'Dave', ctx: daveCtx, page: await daveCtx.newPage() };
+  users.push(dave);
+  dave.page.on('pageerror', (e) => console.error('[Dave] pageerror', e));
+  await dave.page.goto(aliceLink);                // e.g. tapped in a text message
+  await dave.page.waitForSelector('#onboardInvite:has-text("Alice invited you to chat")');
+  await shot(dave, '8-invited-onboarding');
+  await dave.page.fill('#onboardName', 'Dave');
+  await dave.page.click('#onboardForm button[type=submit]');
+  await dave.page.waitForSelector('#chatTitle:has-text("Alice")', { timeout: 15000 });
+  await dave.page.evaluate((r) => window.__iwt.engine.saveSettings({ relays: [r], iceServers: [] }), `ws://127.0.0.1:${RELAY}`);
+  await alice.page.waitForSelector('#toast:has-text("Dave added you from your link")', { timeout: 30000 });
+  await send(dave, 'Hi Alice, Dave here');
+  await openChatWith(alice, 'Dave');
+  await expectMsg(alice, 'Hi Alice, Dave here', 30000);
+
+  step('after Alice resets her link, the old one only produces a contact request');
+  await alice.page.click('#btnSettings');
+  alice.page.once('dialog', (d) => d.accept());
+  await alice.page.click('text=Reset my contact link');
+  await alice.page.click('dialog button[aria-label=Close]').catch(() => {});
+  const erin = await newUser('Erin');
+  await erin.page.goto(aliceLink);                // the stale link
+  await erin.page.waitForSelector('#main:not([hidden])');
+  await erin.page.click('dialog button.primary:has-text("Add Alice")');
+  await alice.page.waitForSelector('#reqBadge:not([hidden])', { timeout: 30000 });
+  assert.equal(await alice.page.evaluate(() => window.__iwt.engine.requests.size), 1);
+  assert.notEqual(await link(alice), aliceLink, 'Alice now shares a different link');
+
   step('nothing readable is stored at rest');
   const leaked = await alice.page.evaluate(async () => {
     const all = await window.__iwt.engine.store.all('ops');
@@ -276,7 +316,15 @@ try {
   assert.ok(relay.stats.events > 0 && relay.stats.rejected === 0, 'relay accepted our Schnorr-signed events');
   assert.deepEqual(Object.keys(relay.stats.kinds), ['25050'], 'public relay only ever saw ephemeral events: nothing to store');
   const wire = relay.stats.log.join('\n');
-  for (const needle of ['Alice', 'Bob', aliceFp, bobFp, 'a=fingerprint', 'candidate', 'hello']) {
+  // Structural check: every event is an opaque base64url blob with only a hashed topic tag.
+  // (Short substrings like "Bob" occur by chance inside ~60 KB of random base64, so we
+  // check shape instead, plus long markers that can't occur by chance.)
+  for (const ev of relay.stats.log.map((l) => JSON.parse(l))) {
+    assert.match(ev.content, /^[A-Za-z0-9_-]+$/, 'content is a single opaque base64url blob');
+    assert.deepEqual(ev.tags.map((t) => t[0]), ['t'], 'only a topic tag');
+    assert.match(ev.tags[0][1], /^[0-9a-f]{32}$/, 'topic is a hash');
+  }
+  for (const needle of [aliceFp, bobFp, 'a=fingerprint', 'candidate:', '"type":"hello"', '"card"']) {
     assert.ok(!wire.includes(needle), `relay saw "${needle}"`);
   }
 
@@ -296,6 +344,10 @@ try {
   console.error('\nE2E FAILED:', e);
   for (const u of users) {
     try {
+      console.error(`--- ${u.name} net:`, JSON.stringify(await u.page.evaluate(() => {
+        const n = window.__iwt.net;
+        return { relays: n.pool.status(), peers: [...n.peers.keys()].map((k) => k.slice(0, 8)), pending: [...n.pending.values()].map((p) => [p.fp?.slice(0, 8), p.state, Date.now() - p.createdAt, p.pc.connectionState, p.pc.signalingState]), contacts: [...window.__iwt.engine.contacts.keys()].map((k) => k.slice(0, 8)), requests: window.__iwt.engine.requests.size };
+      })));
       if (SHOTS) await u.page.screenshot({ path: `${SHOTS}/fail-${u.name}.png` });
       console.error(`--- ${u.name} state:`, JSON.stringify(await u.page.evaluate(() => {
         const e = window.__iwt.engine;

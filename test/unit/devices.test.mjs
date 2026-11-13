@@ -96,3 +96,24 @@ test('own devices merge their address books (adds, nicknames, removals, name)', 
   await phone.mergeOwnDevice(laptop.ownDeviceSummary());
   assert.equal(phone.isContact(carol.identity.fp), false);
 });
+
+test('contact links carry an invite token that can be reset and is shared by own devices', async () => {
+  const alice = await user('Alice');
+  const bob = await user('Bob');
+  const link = alice.myLinkPayload();
+  assert.ok(alice.checkInvite(link.i));
+  await bob.addContact(link);
+  assert.equal(bob.contacts.get(alice.identity.fp).invite, link.i, 'Bob presents it until connected');
+  assert.ok(!('i' in bob.contacts.get(alice.identity.fp).card), 'token is not part of the stored card');
+  await bob.clearInvite(alice.identity.fp);
+  assert.equal(bob.contacts.get(alice.identity.fp).invite, undefined);
+
+  const phone = await cloneDevice(alice);
+  assert.ok(phone.checkInvite(link.i), 'a linked device accepts the same link');
+  await new Promise((r) => setTimeout(r, 5));
+  await phone.resetInvite();
+  assert.equal(phone.checkInvite(link.i), false);
+  await alice.mergeOwnDevice(phone.ownDeviceSummary());
+  assert.equal(alice.checkInvite(link.i), false, 'reset propagates to the other device');
+  assert.ok(alice.checkInvite(phone.myLinkPayload().i));
+});

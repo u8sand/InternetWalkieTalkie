@@ -128,6 +128,14 @@ dialog::backdrop { background: rgb(0 0 0 / .55); }
 video.scan { width: 100%; border-radius: 8px; background: #000; }
 .steps { padding-left: 1.2em; color: var(--muted); }
 .or { text-align: center; margin: 1.2em 0 .4em; }
+.invite-banner { background: color-mix(in srgb, var(--accent) 15%, transparent); border: 1px solid var(--accent); border-radius: 8px; padding: .7em .9em; margin: .8em 0; }
+.qr-btn { display: block; margin: .5em auto; padding: 0; border: none; background: none; }
+.qr-btn .qr { margin: 0; }
+.big-qr .qr { width: min(80vmin, 460px); }
+.share-row { margin: .6em 0; }
+.center { text-align: center; }
+details input { margin-top: .4em; }
+.list .empty .link { margin-top: .4em; }
 #onboardLink { width: 100%; padding: .7em; }
 .progress { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; margin: .6em 0; }
 .progress > div { height: 100%; background: var(--accent); width: 0; transition: width .2s; }

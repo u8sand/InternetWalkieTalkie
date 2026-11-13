@@ -22,8 +22,12 @@ Progressive Web App on GitHub Pages.
 ## Using it
 
 1. Open the site and pick a display name.
-2. **Add contact**: share your contact link or QR code, or paste someone else's. When they come
-   online they get a contact request to accept.
+2. **Invite someone** (＋): share your link (Share / Copy invite message), or let them scan your QR
+   code with their phone camera. Whoever opens it is connected to you straight away, with nothing
+   to approve, even if they've never used the app (setup tells them who invited them). If you
+   have a mailbox relay, this works even while you're offline. To add someone else, open their
+   link or scan their code. Settings → **Reset my contact link** invalidates links you've shared;
+   anyone using an old one only sends a contact request.
 3. Chat. The status pill shows how many relays you're connected to and how many peers are online.
    Messages you write while a contact is offline are stored locally and sync the next time you're
    both online.
@@ -131,6 +135,15 @@ Sync over a DataChannel works like this:
   identity keys, so a man-in-the-middle on signalling can't relay the channel, whatever path the
   SDP took.
 
+### Contact links and invites
+
+A contact link (`#add=…`) carries your public card, your mailbox relays (if any), and a random
+128-bit **invite token**. When someone adds you from it, their device presents the token in
+its hellos, and in a mailed introduction if you have a mailbox. Your device then accepts them
+without a request. The token travels inside the end-to-end-encrypted signal, so relays never
+see it. Once you've connected, they stop presenting it. Resetting the link makes a new token,
+shared across your own devices; old tokens fall back to an ordinary contact request.
+
 ### Multiple devices per identity
 
 Every installation has a random **device id**, which is never copied. Ops are numbered per
@@ -221,6 +234,8 @@ symmetric NATs.
 - **Mailbox relays** you list can see when encrypted mail arrives for your inbox topic and how
   big it is. They can't see the sender, the content or your identity. Use relays you control.
 - **Background checks** happen only in installed Chromium apps, on the browser's schedule.
+- **Your contact link lets anyone who has it add you** without approval. That's the point of
+  sharing it, but if it leaks, reset it.
 - **A link code is as sensitive as your private key** for its 5-minute lifetime: anyone who opens
   it first gets your identity. Within one browser, a Web Lock lets only one tab run.
 - **Device revocation isn't supported.** A lost device keeps the identity. The remedy is a new

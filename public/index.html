@@ -32,6 +32,7 @@
       <img src="icons/icon.svg" alt="" class="logo">
       <h1>Walkie-Talkie</h1>
       <p class="muted">Private messaging with no servers and no accounts. Your identity is a key pair created on this device. Messages are encrypted end to end and sync directly between devices when both are online.</p>
+      <p id="onboardInvite" class="invite-banner" hidden></p>
       <label>Display name
         <input id="onboardName" required maxlength="64" autocomplete="nickname" placeholder="e.g. Sam">
       </label>
@@ -53,7 +54,7 @@
           </div>
         </div>
         <div class="actions">
-          <button id="btnAdd" class="icon" title="Add contact" aria-label="Add contact">＋</button>
+          <button id="btnAdd" class="icon" title="Invite or add someone" aria-label="Invite or add someone">＋</button>
           <button id="btnGroup" class="icon" title="New group" aria-label="New group">👥</button>
           <button id="btnSettings" class="icon" title="Settings" aria-label="Settings">⚙</button>
         </div>

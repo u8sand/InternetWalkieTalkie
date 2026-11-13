@@ -34,6 +34,11 @@ export class Network extends EventTarget {
     engine.addEventListener('op', (e) => { this._fanout(e.detail); if (e.detail.local) this._mailOffline(e.detail); });
     engine.addEventListener('change', (e) => {
       if (e.detail.what === 'contacts') { this._refreshTopics(); this._presence(true); }
+      // Just added someone from their link: if they're offline but have a mailbox,
+      // leave the introduction there so they can accept us without being online together.
+      if (e.detail.what === 'contacts' && e.detail.added && this.engine.contacts.get(e.detail.fp)?.invite) {
+        this._introduce(e.detail.fp);
+      }
     });
     engine.addEventListener('settings', () => { this._setRelays(); this._refreshTopics(); });
   }
@@ -119,12 +124,22 @@ export class Network extends EventTarget {
       if (!force && now - last < HELLO_EVERY_MS) continue;
       if (force && now - last < 3000) continue;
       this.lastHello.set(fp, now);
-      this._signal(fp, this._hello());
+      this._signal(fp, this._hello(undefined, fp));
     }
   }
 
-  _hello(toDev) {
-    return { type: 'hello', dev: this.engine.device, toDev, mb: this.engine.settings.mailboxRelays || [] };
+  _hello(toDev, fp) {
+    const inv = fp && this.engine.contacts.get(fp)?.invite;
+    return { type: 'hello', dev: this.engine.device, toDev, mb: this.engine.settings.mailboxRelays || [], ...(inv ? { inv } : {}) };
+  }
+
+  /** Someone presented our invite token: they got our link from us, so accept them. */
+  async _acceptInvite(sender, payload) {
+    if (!this.engine.checkInvite(payload.inv)) return false;
+    await this.engine.addContact(sender.card, { via: 'invite' });
+    if (Array.isArray(payload.mb)) await this.engine.setPeerMailboxes(sender.fp, payload.mb);
+    this._emit('invited', { fp: sender.fp });
+    return true;
   }
 
   _connecting(fp, dev) {
@@ -153,9 +168,13 @@ export class Network extends EventTarget {
     const ek = fp + '/' + dev;
     debug('signal', payload.type, 'from', ek.slice(0, 8) + '…/' + dev.slice(0, 4));
     if (fp !== me && !this.engine.knownPeers().has(fp)) {
-      // Someone who has our card wants to connect: surface it as a contact request.
-      if (payload.type === 'hello') await this.engine.addRequest(sender.card);
-      return;
+      if (payload.type !== 'hello') return;
+      // With our link's invite token they're accepted straight away; without it (an old
+      // link, or someone who only has our card) it becomes a contact request.
+      if (!(await this._acceptInvite(sender, payload))) {
+        await this.engine.addRequest(sender.card);
+        return;
+      }
     }
     if (fp !== me) {
       this.engine.updatePeerCard(sender.card).catch(() => {});
@@ -183,7 +202,7 @@ export class Network extends EventTarget {
         const last = this.lastReply.get(ek) || 0;
         if (Date.now() - last > 2000) {
           this.lastReply.set(ek, Date.now());
-          this._signal(fp, this._hello(dev));
+          this._signal(fp, this._hello(dev, fp));
         }
       }
     } else if (payload.type === 'offer' && typeof payload.sdp === 'string') {
@@ -234,7 +253,8 @@ export class Network extends EventTarget {
           size += JSON.stringify(pending[i]).length;
           batch.push(pending[i++]);
         }
-        const blob = await sealSignal(this.engine.identity, k, { type: 'mail', ops: batch });
+        const inv = this.engine.contacts.get(fp)?.invite;
+        const blob = await sealSignal(this.engine.identity, k, { type: 'mail', ops: batch, ...(inv ? { inv, mb: this.engine.settings.mailboxRelays || [] } : {}) });
         const acked = await postMail(urls, await inboxTopic(fp), blob);
         debug('mailed', batch.length, 'ops to', fp.slice(0, 8), 'acked by', acked);
         if (!acked) break; // their relay is unreachable: retry later
@@ -244,13 +264,26 @@ export class Network extends EventTarget {
     finally { this.mailing.delete(fp); }
   }
 
+  /** Mail an introduction (no ops) carrying their invite token. */
+  async _introduce(fp) {
+    const urls = this.engine.mailboxes.get(fp) || [];
+    const k = this.engine.keyring.get(fp);
+    const inv = this.engine.contacts.get(fp)?.invite;
+    if (!urls.length || !k || !inv || this.isOnline(fp)) return;
+    try {
+      const blob = await sealSignal(this.engine.identity, k, { type: 'mail', ops: [], inv, mb: this.engine.settings.mailboxRelays || [] });
+      debug('introduced to', fp.slice(0, 8), 'acked by', await postMail(urls, await inboxTopic(fp), blob));
+    } catch (e) { debug('introduce failed', e); }
+  }
+
   /** Encrypted mail from one of our own mailbox relays (live, on open, or fetched by the SW). */
   async _onMail(ev) {
     let payload, sender;
     try { ({ payload, sender } = await openSignal(this.engine.identity, ev.content)); } catch { return; }
     if (payload.type !== 'mail' || !Array.isArray(payload.ops)) return;
     if (Date.now() - payload.ts > (MAIL_TTL_S + 86400) * 1000) return;
-    if (!this.engine.knownPeers().has(sender.fp)) return; // strangers can't mail us
+    // Strangers can't mail us, unless they present our link's invite token.
+    if (!this.engine.knownPeers().has(sender.fp) && !(await this._acceptInvite(sender, payload))) return;
     let added = 0;
     for (const env of payload.ops.slice(0, 500)) {
       if (env?.author !== sender.fp) continue; // only authors mail their own ops
@@ -280,6 +313,7 @@ export class Network extends EventTarget {
       const fp = peer.remote.fp;
       if (!peer.ownDevice) {
         if (peer.manual && !this.engine.isContact(fp)) await this.engine.addContact(peer.remote.card);
+        await this.engine.clearInvite(fp); // they know us now
         this.engine.updatePeerCard(peer.remote.card).catch(() => {});
         await this.engine.setPeerMailboxes(fp, peer.remoteMailboxes || []);
         await this.engine.clearMail(fp); // direct sync supersedes anything queued
