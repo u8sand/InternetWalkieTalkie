@@ -26,7 +26,7 @@ test('op seal/open/verify round trip and tamper detection', async () => {
   const b = await C.generateIdentity('b');
   const bk = await C.importCard(b.card());
   assert.equal(bk.fp, b.fp);
-  const env = await C.sealOp(a, [{ fp: a.fp, dhKey: a.dhPub }, bk], { conv: 'd:x', seq: 1, lamport: 1, ts: Date.now() }, { type: 'msg', text: 'hi' });
+  const env = await C.sealOp(a, [{ fp: a.fp, dhKey: a.dhPub }, bk], { conv: 'd:x', dev: '00000000000000aa', seq: 1, lamport: 1, ts: Date.now() }, { type: 'msg', text: 'hi' });
   assert.ok(await C.verifyOp(env, a.signPub));
   assert.deepEqual(await C.openOp(b, env), { type: 'msg', text: 'hi' });
   assert.deepEqual(await C.openOp(a, env), { type: 'msg', text: 'hi' });
@@ -112,7 +112,7 @@ test('rejects forged, foreign and non-member ops', async () => {
   // Mallory authors an op claiming to be in the A<->B conversation.
   const mi = m.identity;
   const bk = m.keyring.get(b.identity.fp);
-  const fake = await C.sealOp(mi, [bk], { conv, seq: 1, lamport: 1, ts: Date.now() }, { type: 'msg', text: 'evil' });
+  const fake = await C.sealOp(mi, [bk], { conv, dev: '00000000000000aa', seq: 1, lamport: 1, ts: Date.now() }, { type: 'msg', text: 'evil' });
   assert.equal((await b.ingest(fake)).reason, 'author not a member');
   // Genuine op is accepted once, duplicates ignored.
   assert.equal((await b.ingest(structuredClone(env))).added, true);

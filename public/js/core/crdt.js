@@ -2,9 +2,10 @@
 //
 // Each conversation is an op-based CRDT whose state is the *set* of signed ops
 // (a grow-only set — merge is set union, so it is commutative, associative and
-// idempotent). Every author numbers their ops 1,2,3… per conversation, so the
-// set a replica holds is summarised exactly by a version vector
-// {author: highest contiguous seq}. Two replicas sync by exchanging version
+// idempotent). Every *stream* — one identity on one device, "author/dev" — numbers
+// its ops 1,2,3… per conversation, so the set a replica holds is summarised exactly
+// by a version vector {stream: highest contiguous seq}. Streams are per device so an
+// identity cloned onto a phone and a laptop never reuses a sequence number. Two replicas sync by exchanging version
 // vectors and sending each other the ops the other side is missing.
 //
 // The visible state (messages, deletions, group name) is a pure function of the
@@ -16,9 +17,9 @@
 // Expiry. Every conversation has an agreed retention period (fixed in the signed
 // group-creation op, or a protocol default for direct chats). An op whose signed
 // header timestamp is older than that is deleted everywhere. To stay a correct
-// CRDT, each replica keeps a per-author *floor*: the seq of that author's newest
-// expired op, which is kept as a signed "watermark". Authors' timestamps never
-// decrease, so the watermark proves every earlier op from that author has expired.
+// CRDT, each replica keeps a per-stream *floor*: the seq of that stream's newest
+// expired op, which is kept as a signed "watermark". A device's timestamps never
+// decrease, so the watermark proves every earlier op in that stream has expired.
 // The version vector counts from the floor, so peers stop asking for or resending
 // expired history. A replica that was away longer than the retention period just
 // receives the watermark and moves its floor up. State ops (group creation, renames)
@@ -26,83 +27,91 @@
 
 export const PINNED_TYPES = new Set(['group', 'rename']);
 
+const cmp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+
 export function compareOps(a, b) {
-  return a.lamport - b.lamport || (a.author < b.author ? -1 : a.author > b.author ? 1 : 0) || a.seq - b.seq;
+  return a.lamport - b.lamport || cmp(a.author, b.author) || cmp(a.dev || '', b.dev || '') || a.seq - b.seq;
 }
 
-export const msgId = (author, seq) => author + ':' + seq;
+/** Version-vector key: one writer = one identity on one device. */
+export const streamOf = (env) => env.author + '/' + env.dev;
+
+/** Message id; starts with the author fingerprint so authorship checks stay simple. */
+export const msgId = (env) => env.author + ':' + env.dev + ':' + env.seq;
 
 /** Per-conversation set of encrypted ops with version-vector bookkeeping. */
 export class OpLog {
   constructor() {
-    this.byAuthor = new Map(); // author -> Map<seq, env> (live ops, pinned ops, watermark)
-    this.contig = new Map();   // author -> highest contiguous seq (counting from the floor)
-    this.floors = new Map();   // author -> seq of the newest expired op (everything ≤ it is gone or pinned)
+    this.byAuthor = new Map(); // stream -> Map<seq, env> (live ops, pinned ops, watermark)
+    this.contig = new Map();   // stream -> highest contiguous seq (counting from the floor)
+    this.floors = new Map();   // stream -> seq of the newest expired op (everything ≤ it is gone or pinned)
     this.pinned = new Set();   // keys of ops that never expire
   }
 
-  floor(author) {
-    return this.floors.get(author) || 0;
+  floor(stream) {
+    return this.floors.get(stream) || 0;
   }
 
-  _recount(author) {
-    const m = this.byAuthor.get(author) || new Map();
-    let c = Math.max(this.contig.get(author) || 0, this.floor(author));
+  _recount(stream) {
+    const m = this.byAuthor.get(stream) || new Map();
+    let c = Math.max(this.contig.get(stream) || 0, this.floor(stream));
     while (m.has(c + 1)) c++;
-    this.contig.set(author, c);
+    this.contig.set(stream, c);
   }
 
-  has(author, seq) {
-    return !!this.byAuthor.get(author)?.has(seq);
+  has(stream, seq) {
+    return !!this.byAuthor.get(stream)?.has(seq);
   }
 
-  get(author, seq) {
-    return this.byAuthor.get(author)?.get(seq);
+  get(stream, seq) {
+    return this.byAuthor.get(stream)?.get(seq);
   }
 
   /** Returns true if the op was new. */
   add(env, pinned = false) {
-    let m = this.byAuthor.get(env.author);
-    if (!m) { m = new Map(); this.byAuthor.set(env.author, m); }
+    const st = streamOf(env);
+    let m = this.byAuthor.get(st);
+    if (!m) { m = new Map(); this.byAuthor.set(st, m); }
     if (m.has(env.seq)) return false;
     m.set(env.seq, env);
-    if (pinned) this.pinned.add(msgId(env.author, env.seq));
-    this._recount(env.author);
+    if (pinned) this.pinned.add(msgId(env));
+    this._recount(st);
     return true;
   }
 
   /**
-   * Raise an author's floor to `watermark` (an expired op already added to this log).
+   * Raise an stream's floor to `watermark` (an expired op already added to this log).
    * Returns the ops dropped: everything at or below it that isn't pinned, except the watermark.
    */
   advanceFloor(watermark) {
-    const { author, seq } = watermark;
-    if (seq <= this.floor(author)) return [];
-    const m = this.byAuthor.get(author);
+    const st = streamOf(watermark);
+    const { seq } = watermark;
+    if (seq <= this.floor(st)) return [];
+    const m = this.byAuthor.get(st);
     const dropped = [];
     for (const [s, env] of m) {
-      if (s < seq && !this.pinned.has(msgId(author, s))) { m.delete(s); dropped.push(env); }
+      if (s < seq && !this.pinned.has(msgId(env))) { m.delete(s); dropped.push(env); }
     }
-    this.floors.set(author, seq);
-    this._recount(author);
+    this.floors.set(st, seq);
+    this._recount(st);
     return dropped;
   }
 
-  /** The newest op per author whose timestamp is at or before `cutoff` (candidate watermarks). */
+  /** The newest op per stream whose timestamp is at or before `cutoff` (candidate watermarks). */
   expiredHeads(cutoff) {
     const out = [];
-    for (const [author, m] of this.byAuthor) {
+    for (const [st, m] of this.byAuthor) {
       let best = null;
       for (const env of m.values()) if (env.ts <= cutoff && (!best || env.seq > best.seq)) best = env;
-      if (best && best.seq > this.floor(author)) out.push(best);
+      if (best && best.seq > this.floor(st)) out.push(best);
     }
     return out;
   }
 
-  nextSeq(author) {
-    const m = this.byAuthor.get(author);
+  nextSeq(stream) {
+    const m = this.byAuthor.get(stream);
     const top = m && m.size ? Math.max(...m.keys()) : 0;
-    return Math.max(top, this.floor(author)) + 1;
+    return Math.max(top, this.floor(stream)) + 1;
   }
 
   vv() {
@@ -114,8 +123,8 @@ export class OpLog {
   /** Ops the holder of `remoteVV` is missing, in causal-friendly order. */
   since(remoteVV = {}) {
     const out = [];
-    for (const [author, m] of this.byAuthor) {
-      const have = Number.isSafeInteger(remoteVV[author]) ? remoteVV[author] : 0;
+    for (const [st, m] of this.byAuthor) {
+      const have = Number.isSafeInteger(remoteVV[st]) ? remoteVV[st] : 0;
       for (const [seq, env] of m) if (seq > have) out.push(env);
     }
     return out.sort(compareOps);
@@ -141,7 +150,7 @@ export class ConversationView {
   /** Forget expired messages (their ops were pruned from the log). */
   remove(envs) {
     for (const env of envs) {
-      const id = msgId(env.author, env.seq);
+      const id = msgId(env);
       this.messages.delete(id);
       this.tombstones.delete(id);
     }
@@ -149,13 +158,13 @@ export class ConversationView {
   }
 
   apply(env, body) {
-    const id = msgId(env.author, env.seq);
+    const id = msgId(env);
     const ts = Number.isFinite(body.ts) ? body.ts : 0;
     switch (body.type) {
       case 'msg': {
         if (typeof body.text !== 'string') return;
         this.messages.set(id, {
-          id, author: env.author, seq: env.seq, lamport: env.lamport, ts,
+          id, author: env.author, dev: env.dev, seq: env.seq, lamport: env.lamport, ts,
           text: body.text.slice(0, 20000), deleted: this.tombstones.has(id),
         });
         this._sorted = null;
@@ -172,7 +181,7 @@ export class ConversationView {
       case 'group':
       case 'rename': {
         if (typeof body.name !== 'string') return;
-        const stamp = { lamport: env.lamport, author: env.author, seq: env.seq };
+        const stamp = { lamport: env.lamport, author: env.author, dev: env.dev, seq: env.seq };
         if (!this.nameStamp || compareOps(this.nameStamp, stamp) < 0) {
           this.name = body.name.slice(0, 80);
           this.nameStamp = stamp;

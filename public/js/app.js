@@ -3,6 +3,7 @@
 import { Engine, RETENTION_CHOICES, DEFAULT_RETENTION_DAYS } from './core/engine.js';
 import { IDBStore } from './core/store.js';
 import { Network } from './core/net.js';
+import { LinkHost, LinkJoin, LINK_TTL_MS } from './core/link.js';
 import { importCard, safetyNumber } from './core/crypto.js';
 import { b64u, fromB64u, utf8, fromUtf8 } from './core/encoding.js';
 import qrcode from './vendor/qrcode.js';
@@ -380,6 +381,13 @@ function showSettings() {
     } })),
 
     h('div', { class: 'section' },
+      h('h3', { text: 'Your devices' }),
+      h('p', { class: 'muted small', text: net.ownDevicesOnline()
+        ? `${net.ownDevicesOnline()} other device${net.ownDevicesOnline() === 1 ? '' : 's'} of yours connected now. Your devices keep each other's history and contacts in sync.`
+        : 'Use the same identity on your phone and computer. Each device keeps the full history and they sync with each other.' }),
+      h('button', { text: 'Link a new device…', onclick: showLinkHost })),
+
+    h('div', { class: 'section' },
       h('h3', { text: 'Connect without relays' }),
       h('button', { text: 'Direct connection codes…', onclick: showManual })),
 
@@ -408,6 +416,79 @@ function showSettings() {
     h('p', { class: 'muted small', style: 'margin-top:1.5em' }, h('span', { id: 'appVersion' })),
   );
   navigator.serviceWorker?.controller && caches.keys().then((k) => { const el = $('appVersion'); if (el) el.textContent = 'Cache: ' + k.join(', '); });
+}
+
+// ------------------------------------------------------------------ device linking
+
+async function showLinkHost() {
+  let host;
+  try { host = await LinkHost.start(engine); } catch (e) { return toast(e.message); }
+  const url = location.origin + location.pathname + '#link=' + host.code;
+  const status = h('p', { class: 'strong', text: 'Waiting for your new device…' });
+  const bar = h('div');
+  const left = h('span', { class: 'muted small' });
+  const started = Date.now();
+  const tick = setInterval(() => {
+    const s = Math.max(0, Math.round((LINK_TTL_MS - (Date.now() - started)) / 1000));
+    left.textContent = `Code expires in ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  }, 500);
+  onDialogClose(() => { clearInterval(tick); if (host.state !== 'done') host.close(); });
+  host.addEventListener('status', (e) => {
+    const d = e.detail;
+    if (d.state === 'connecting') status.textContent = 'New device found, connecting…';
+    if (d.state === 'sending') { status.textContent = `Copying your identity and history… ${Math.round((d.progress || 0) * 100)}%`; bar.style.width = (d.progress || 0) * 100 + '%'; }
+    if (d.state === 'done') { status.textContent = '✓ Linked. Your new device is ready.'; bar.style.width = '100%'; clearInterval(tick); left.textContent = ''; toast('New device linked'); }
+    if (d.state === 'failed') { status.textContent = d.message; clearInterval(tick); }
+  });
+  openDialog('Link a new device',
+    h('ol', { class: 'steps' },
+      h('li', { text: 'On your new device, scan this code with the camera (or open the link).' }),
+      h('li', { text: 'Or open Walkie-Talkie there and choose "Link to my other device", then paste the link.' })),
+    qrCanvas(url),
+    h('div', { class: 'row' },
+      h('input', { readonly: true, value: url, class: 'grow mono', onfocus: (e) => e.target.select(), 'aria-label': 'Device link' }),
+      h('button', { text: 'Copy', onclick: () => copy(url, 'Link copied') })),
+    status, h('div', { class: 'progress' }, bar), left,
+    h('p', { class: 'small warn', text: '⚠ This code gives full access to your identity and messages. Only open it on a device you own, and don\'t share it. It works once and expires in 5 minutes.' }),
+  );
+}
+
+function showLinkJoin(prefill = '') {
+  const input = h('textarea', { class: 'codebox', placeholder: 'Paste the link shown on your other device', 'aria-label': 'Device link code' });
+  input.value = prefill;
+  const status = h('p', { class: 'muted' });
+  const bar = h('div');
+  let join = null;
+  onDialogClose(() => { if (join && join.state !== 'done') join.close(); });
+  const go = async () => {
+    try {
+      join = await LinkJoin.start(input.value);
+    } catch (e) { status.textContent = e.message; return; }
+    btn.disabled = true;
+    status.textContent = 'Looking for your other device…';
+    join.addEventListener('status', (e) => {
+      const d = e.detail;
+      if (d.state === 'receiving') { status.textContent = `Receiving your identity and history… ${Math.round((d.progress || 0) * 100)}%`; bar.style.width = (d.progress || 0) * 100 + '%'; }
+      if (d.state === 'failed') { status.textContent = d.message; btn.disabled = false; }
+    });
+    try {
+      const state = await join.result;
+      status.textContent = 'Saving…';
+      await engine.importState(state);
+      status.textContent = '✓ Linked. Starting…';
+      setTimeout(() => location.replace(location.pathname), 300);
+    } catch (e) { status.textContent = e.message; btn.disabled = false; }
+  };
+  const btn = h('button', { class: 'primary', text: 'Link this device', onclick: go });
+  openDialog('Link to my other device',
+    h('ol', { class: 'steps' },
+      h('li', { text: 'On the device you already use: Settings → Link a new device.' }),
+      h('li', { text: 'Scan the code shown there, or paste its link below.' })),
+    input,
+    h('div', { class: 'row end', style: 'margin-top:.5em' }, scanButton((t) => { input.value = t; go(); }), btn),
+    status, h('div', { class: 'progress' }, bar),
+  );
+  if (prefill) go();
 }
 
 function showRestore() {
@@ -609,6 +690,10 @@ function wireMain() {
 }
 
 function handleHash() {
+  if (/^#link=/.test(location.hash)) {
+    history.replaceState(null, '', location.pathname + location.search);
+    return toast('This device already has an identity. To link it to another one, first use Settings → Delete everything on this device.', null, 8000);
+  }
   const m = /^#add=([A-Za-z0-9_-]+)/.exec(location.hash);
   if (!m) return;
   history.replaceState(null, '', location.pathname + location.search);
@@ -731,6 +816,10 @@ async function boot() {
     startApp();
   };
   $('onboardRestore').onclick = showRestore;
+  $('onboardLink').onclick = () => showLinkJoin();
+  // Opened by scanning the link QR code with this device's camera.
+  const m = /^#link=([A-Za-z0-9_-]+)/.exec(location.hash);
+  if (m) { history.replaceState(null, '', location.pathname + location.search); showLinkJoin(m[1]); }
 }
 
 // Only one tab may run the engine (two writers would reuse sequence numbers).

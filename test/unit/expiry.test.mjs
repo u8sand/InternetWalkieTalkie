@@ -45,7 +45,7 @@ test('expired messages are deleted, leaving one signed watermark per author', as
   assert.deepEqual(texts(a, conv), ['fresh']);
   assert.deepEqual(texts(b, conv), []);
   assert.equal((await a.store.all('ops')).length, 2, 'watermark + fresh op');
-  assert.equal(a.logs.get(conv).floor(a.identity.fp), 5);
+  assert.equal(a.logs.get(conv).floor(a.identity.fp + '/' + a.device), 5);
   await sync(a, b);
   assert.deepEqual(texts(b, conv), ['fresh']);
   assert.equal(await sync(a, b), 0, 'nothing expired is resent');
@@ -104,7 +104,7 @@ test('reload rebuilds floors from stored watermarks', async () => {
   const a2 = new Engine(store); a2.now = () => clock;
   await a2.load();
   assert.deepEqual(texts(a2, conv), ['z']);
-  assert.equal(a2.logs.get(conv).floor(a.identity.fp), 2);
+  assert.equal(a2.logs.get(conv).floor(a.identity.fp + '/' + a.device), 2);
   const next = await a2.sendText(conv, 'w');
   assert.equal(next.seq, 4);
   assert.ok(next.ts >= clock);

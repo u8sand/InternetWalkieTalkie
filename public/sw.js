@@ -14,6 +14,7 @@ const ASSETS = [
   'js/core/crypto.js',
   'js/core/encoding.js',
   'js/core/engine.js',
+  'js/core/link.js',
   'js/core/net.js',
   'js/core/peer.js',
   'js/core/schnorr.js',

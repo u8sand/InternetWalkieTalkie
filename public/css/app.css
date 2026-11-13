@@ -127,6 +127,11 @@ dialog::backdrop { background: rgb(0 0 0 / .55); }
 .safety { font-family: ui-monospace, monospace; font-size: 1.1em; letter-spacing: .05em; text-align: center; padding: .6em; background: var(--panel-2); border-radius: 8px; }
 video.scan { width: 100%; border-radius: 8px; background: #000; }
 .steps { padding-left: 1.2em; color: var(--muted); }
+.or { text-align: center; margin: 1.2em 0 .4em; }
+#onboardLink { width: 100%; padding: .7em; }
+.progress { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; margin: .6em 0; }
+.progress > div { height: 100%; background: var(--accent); width: 0; transition: width .2s; }
+.warn { color: var(--warn); }
 .steps li { margin: .3em 0; }
 
 #toast { position: fixed; left: 50%; bottom: 1.5em; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: .7em 1em; box-shadow: 0 8px 30px rgb(0 0 0 / .3); display: none; align-items: center; gap: .8em; z-index: 10; max-width: calc(100vw - 2em); }

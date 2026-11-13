@@ -17,7 +17,8 @@ const ECDSA = { name: 'ECDSA', namedCurve: 'P-256' };
 const ECDH = { name: 'ECDH', namedCurve: 'P-256' };
 const SIGN_ALG = { name: 'ECDSA', hash: 'SHA-256' };
 
-// v2: the signed header carries the author's timestamp so every member can expire ops identically.
+// v2: the signed header carries the author's timestamp (so every member can expire ops identically)
+// and the authoring device id (so one identity on several devices never reuses a seq).
 export const OP_VERSION = 2;
 
 // ---------------------------------------------------------------- identity
@@ -136,7 +137,7 @@ async function aesDecrypt(key, blob, aad) {
 
 // ---------------------------------------------------------------- ops (CRDT updates)
 
-const HEADER_FIELDS = ['v', 'conv', 'author', 'seq', 'lamport', 'ts'];
+const HEADER_FIELDS = ['v', 'conv', 'author', 'dev', 'seq', 'lamport', 'ts'];
 
 export function opHeader(env) {
   const h = {};
@@ -153,11 +154,11 @@ function unsignedEnvelope(env) {
  * Encrypt and sign an op body for a set of recipients.
  * @param id         author identity
  * @param recipients [{fp, dhKey}] — must include the author so their other copies stay readable
- * @param header     {conv, seq, lamport, ts} — ts: author wall clock (ms), non-decreasing per author
+ * @param header     {conv, dev, seq, lamport, ts} — ts: device wall clock (ms), non-decreasing per device
  * @param body       JSON-serialisable plaintext
  */
 export async function sealOp(id, recipients, header, body) {
-  const h = { v: OP_VERSION, conv: header.conv, author: id.fp, seq: header.seq, lamport: header.lamport, ts: header.ts };
+  const h = { v: OP_VERSION, conv: header.conv, author: id.fp, dev: header.dev, seq: header.seq, lamport: header.lamport, ts: header.ts };
   const aad = utf8(canonical(h));
   const cekRaw = randomBytes(32);
   const cek = await subtle.importKey('raw', cekRaw, 'AES-GCM', false, ['encrypt']);
@@ -180,6 +181,7 @@ export function isWellFormedOp(env) {
     && env.v === OP_VERSION
     && typeof env.conv === 'string' && env.conv.length <= 80
     && typeof env.author === 'string' && /^[0-9a-f]{40}$/.test(env.author)
+    && typeof env.dev === 'string' && /^[0-9a-f]{16}$/.test(env.dev)
     && Number.isSafeInteger(env.seq) && env.seq > 0
     && Number.isSafeInteger(env.lamport) && env.lamport > 0
     && Number.isSafeInteger(env.ts) && env.ts > 0

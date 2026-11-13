@@ -11,7 +11,7 @@ import { serve } from '../serve.mjs';
 import { startRelay } from '../relay.mjs';
 
 // Resolved via require so a globally installed Playwright (NODE_PATH) also works.
-const { chromium } = createRequire(import.meta.url)('playwright');
+const { chromium, devices } = createRequire(import.meta.url)('playwright');
 
 const WEB = 8080, RELAY = 7777, MAILBOX = 7778;
 const MAIL_KIND = 4050;
@@ -75,8 +75,9 @@ const until = async (fn, ms = 20000, what = 'condition') => {
 };
 
 async function openChatWith(u, title) {
+  if (await u.page.isVisible('#btnBack')) await u.page.click('#btnBack'); // phone layout: back to the list
   await u.page.click('.tabs [data-tab=chats]');
-  await u.page.click(`#convList li:has-text("${title}")`);
+  await u.page.click(`#convList li:has(.title span:text-is("${title}"))`);
 }
 
 async function send(u, text) {
@@ -215,17 +216,54 @@ try {
   await expectMsg(carol, 'Bob says hi to the group');
   await shot(bob, '4-group');
 
-  step('all three replicas converge on identical history');
+  step("Bob links his phone by opening the QR link; it gets his identity and full history");
+  await bob.page.click('#btnSettings');
+  await bob.page.click('text=Link a new device…');
+  const linkUrl = await bob.page.inputValue('input[aria-label="Device link"]');
+  const phoneCtx = await browser.newContext({ ...devices['Pixel 7'] });
+  await phoneCtx.grantPermissions(['notifications']);
+  const phone = { name: 'Bob-phone', ctx: phoneCtx, page: await phoneCtx.newPage() };
+  users.push(phone);
+  phone.page.on('pageerror', (e) => console.error('[Bob-phone] pageerror', e));
+  phone.page.on('console', (m) => { if (m.type() === 'error' || process.env.IWT_DEBUG) console.error('[Bob-phone]', m.text()); });
+  await phone.page.goto(linkUrl);                   // what scanning the QR code does
+  await bob.page.waitForSelector('dialog :text("Linked. Your new device is ready.")', { timeout: 40000 });
+  await shot(bob, '6-link-host');
+  await phone.page.waitForSelector('#main:not([hidden])', { timeout: 20000 });
+  assert.equal(await fp(phone), bobFp, 'same identity on the phone');
+  const devs = await Promise.all([bob, phone].map((u) => u.page.evaluate(() => window.__iwt.engine.device)));
+  assert.notEqual(devs[0], devs[1], 'but a distinct device id');
+  await bob.page.click('dialog button[aria-label=Close]');
+  await openChatWith(phone, 'Walkie crew');
+  await expectMsg(phone, 'Bob says hi to the group');
+  await shot(phone, '7-phone-history');
+
+  step("the phone and laptop sync with each other, and both chat as Bob");
+  await phone.page.waitForFunction((f) => window.__iwt.net.devicesOf(f).length > 0, bobFp, { timeout: 40000 });
+  await send(phone, 'Bob, now on his phone');
+  await expectMsg(carol, 'Bob, now on his phone', 30000);
+  await expectMsg(bob, 'Bob, now on his phone', 30000);
+  await openChatWith(alice, 'Bob');
+  await send(alice, 'Reaches both of your devices');
+  await openChatWith(phone, 'Alice');
+  await expectMsg(phone, 'Reaches both of your devices', 30000);
+  await openChatWith(bob, 'Alice');
+  await expectMsg(bob, 'Reaches both of your devices', 30000);
+  await openChatWith(alice, 'Walkie crew');
+  await openChatWith(bob, 'Walkie crew');
+
+  step('all replicas, including both of Bob\'s devices, converge on identical history');
   const history = (u) => u.page.evaluate(() => {
     const e = window.__iwt.engine;
     const g = [...e.convs.values()].find((c) => c.kind === 'group');
     return e.views.get(g.id).list().map((m) => m.author.slice(0, 6) + ':' + m.text);
   });
-  await alice.page.waitForTimeout(500);
-  const [ha, hb, hc] = await Promise.all([history(alice), history(bob), history(carol)]);
+  await alice.page.waitForTimeout(1000);
+  const [ha, hb, hc, hp] = await Promise.all([history(alice), history(bob), history(carol), history(phone)]);
   assert.deepEqual(ha, hb);
   assert.deepEqual(hb, hc);
-  assert.equal(ha.length, 3);
+  assert.deepEqual(hc, hp);
+  assert.equal(ha.length, 4);
 
   step('nothing readable is stored at rest');
   const leaked = await alice.page.evaluate(async () => {

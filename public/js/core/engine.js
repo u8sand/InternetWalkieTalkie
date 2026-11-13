@@ -6,8 +6,10 @@ import {
   generateIdentity, importIdentity, exportIdentity, importCard, sealOp, openOp, verifyOp,
   isWellFormedOp, encryptBackup, decryptBackup,
 } from './crypto.js';
-import { OpLog, ConversationView, msgId, PINNED_TYPES } from './crdt.js';
+import { OpLog, ConversationView, msgId, streamOf, PINNED_TYPES } from './crdt.js';
 import { utf8, hex, sha256, b64u, randomBytes } from './encoding.js';
+
+const newDeviceId = () => hex(randomBytes(8));
 
 export const DEFAULT_SETTINGS = {
   relays: ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net', 'wss://nostr.mom'],
@@ -30,7 +32,7 @@ export function cleanRelayList(list) {
   return [...new Set((Array.isArray(list) ? list : []).filter((u) => typeof u === 'string' && /^wss?:\/\/[^\s]{1,200}$/.test(u)))].slice(0, MAX_MAILBOXES);
 }
 
-export const opKey = (env) => env.conv + '|' + env.author + '|' + env.seq;
+export const opKey = (env) => env.conv + '|' + env.author + '|' + env.dev + '|' + env.seq;
 
 export async function directConvId(a, b) {
   const [x, y] = [a, b].sort();
@@ -57,7 +59,10 @@ export class Engine extends EventTarget {
     this.mailboxes = new Map(); // fp -> [relay url]: where that peer collects offline mail
     this.outbox = new Map();    // fp -> Set<opKey>: our ops still to be mailed to that peer
     this.mailSince = 0;         // unix seconds: newest mailbox event we've processed
-    this.lastTs = 0;            // our ops' timestamps never decrease (expiry watermarks rely on it)
+    this.device = null;         // random id of this installation; never copied to other devices
+    this.lastTs = 0;            // this device's op timestamps never decrease (expiry watermarks rely on it)
+    this.removed = {};          // fp -> ms: contact removals, merged across our own devices
+    this.nameAt = 0;            // when our display name last changed (merged across our devices)
     this.now = () => Date.now(); // overridable clock (tests)
     this._queue = Promise.resolve();
   }
@@ -79,6 +84,9 @@ export class Engine extends EventTarget {
     const stored = await this.store.get('kv', 'identity');
     if (!stored) return false;
     this.identity = await importIdentity(stored);
+    this.device = await this._deviceId();
+    this.removed = (await this.store.get('kv', 'removed')) || {};
+    this.nameAt = (await this.store.get('kv', 'nameAt')) || 0;
     this.settings = { ...DEFAULT_SETTINGS, ...((await this.store.get('kv', 'settings')) || {}) };
     this._addKey({ fp: this.identity.fp, name: this.identity.name, signKey: this.identity.signPub, dhKey: this.identity.dhPub, card: this.identity.card() });
 
@@ -107,7 +115,7 @@ export class Engine extends EventTarget {
       try {
         const body = await openOp(this.identity, env);
         this._applyOp(env, body);
-        if (env.author === this.identity.fp && env.ts > this.lastTs) this.lastTs = env.ts;
+        if (env.author === this.identity.fp && env.dev === this.device && env.ts > this.lastTs) this.lastTs = env.ts;
       } catch (e) { console.warn('stored op unreadable', e); }
     }
     await this._prune();
@@ -125,8 +133,16 @@ export class Engine extends EventTarget {
     });
   }
 
+  /** Each installation gets its own device id (kept out of backups and device links). */
+  async _deviceId() {
+    let d = await this.store.get('kv', 'device');
+    if (!d) { d = newDeviceId(); await this.store.put('kv', 'device', d); }
+    return d;
+  }
+
   async createIdentity(name) {
     this.identity = await generateIdentity(name.trim().slice(0, 64) || 'Anonymous');
+    this.device = await this._deviceId();
     await this.store.put('kv', 'identity', await exportIdentity(this.identity));
     await this.store.put('kv', 'settings', this.settings);
     this._addKey({ fp: this.identity.fp, name: this.identity.name, signKey: this.identity.signPub, dhKey: this.identity.dhPub, card: this.identity.card() });
@@ -134,8 +150,10 @@ export class Engine extends EventTarget {
     return this.identity;
   }
 
-  async setName(name) {
+  async setName(name, at = Date.now()) {
     this.identity.name = name.trim().slice(0, 64) || this.identity.name;
+    this.nameAt = at;
+    await this.store.put('kv', 'nameAt', at);
     await this.store.put('kv', 'identity', await exportIdentity(this.identity));
     this.keyring.get(this.identity.fp).name = this.identity.name;
     this._emit('change', { what: 'identity' });
@@ -182,14 +200,18 @@ export class Engine extends EventTarget {
     return m.length ? { ...this.identity.card(), m } : this.identity.card();
   }
 
-  async addContact(card) {
+  async addContact(card, { addedAt = Date.now(), nick, nickAt } = {}) {
     const k = await importCard(card);
-    if (Array.isArray(card.m)) await this.setPeerMailboxes(k.fp, card.m);
     if (k.fp === this.identity.fp) throw new Error("That's your own card");
+    if (Array.isArray(card.m)) await this.setPeerMailboxes(k.fp, card.m);
     return this._serial(async () => {
       this._addKey(k);
       const existing = this.contacts.get(k.fp);
-      const c = { fp: k.fp, card: k.card, nick: existing?.nick || '', addedAt: existing?.addedAt || Date.now() };
+      const c = {
+        fp: k.fp, card: k.card, addedAt: existing?.addedAt || addedAt,
+        nick: existing?.nick || nick || '', nickAt: existing?.nickAt || nickAt || 0,
+      };
+      if (this.removed[k.fp]) { delete this.removed[k.fp]; await this.store.put('kv', 'removed', this.removed); }
       this.contacts.set(k.fp, c);
       await this.store.put('contacts', k.fp, c);
       if (this.requests.delete(k.fp)) await this.store.del('requests', k.fp);
@@ -234,8 +256,8 @@ export class Engine extends EventTarget {
   pendingMail(fp) {
     const out = [];
     for (const key of this.outbox.get(fp) || []) {
-      const [conv, author, seq] = key.split('|');
-      const env = this.logs.get(conv)?.get(author, Number(seq));
+      const [conv, author, dev, seq] = key.split('|');
+      const env = this.logs.get(conv)?.get(author + '/' + dev, Number(seq));
       if (env) out.push(env);
     }
     return out.sort((a, b) => a.lamport - b.lamport);
@@ -260,17 +282,20 @@ export class Engine extends EventTarget {
     await this._saveBackgroundConfig();
   }
 
-  async setNick(fp, nick) {
+  async setNick(fp, nick, at = Date.now()) {
     const c = this.contacts.get(fp);
     if (!c) return;
     c.nick = nick.trim().slice(0, 64);
+    c.nickAt = at;
     await this.store.put('contacts', fp, c);
     this._emit('change', { what: 'contacts' });
   }
 
-  async removeContact(fp) {
+  async removeContact(fp, at = Date.now()) {
     if (!this.contacts.delete(fp)) return;
     await this.store.del('contacts', fp);
+    this.removed[fp] = at;
+    await this.store.put('kv', 'removed', this.removed);
     this._emit('change', { what: 'contacts' });
   }
 
@@ -361,7 +386,7 @@ export class Engine extends EventTarget {
       for (const wm of log.expiredHeads(this._cutoff(conv))) {
         const dropped = log.advanceFloor(wm);
         for (const e of dropped) await this.store.del('ops', opKey(e));
-        view.remove(log.pinned.has(msgId(wm.author, wm.seq)) ? dropped : [...dropped, wm]);
+        view.remove(log.pinned.has(msgId(wm)) ? dropped : [...dropped, wm]);
         changed = true;
       }
     }
@@ -412,7 +437,7 @@ export class Engine extends EventTarget {
     const recipients = conv.members.map((fp) => this.keyring.get(fp)).filter(Boolean);
     this.lastTs = Math.max(this.now(), this.lastTs);
     const env = await sealOp(this.identity, recipients, {
-      conv: convId, seq: log.nextSeq(this.identity.fp), lamport: this.clock + 1, ts: this.lastTs,
+      conv: convId, dev: this.device, seq: log.nextSeq(this.identity.fp + '/' + this.device), lamport: this.clock + 1, ts: this.lastTs,
     }, body);
     await this.store.put('ops', opKey(env), env);
     this._applyOp(env, body);
@@ -457,7 +482,7 @@ export class Engine extends EventTarget {
     if (env.lamport > this.clock + 1e6) return { added: false, reason: 'lamport out of range' };
     const me = this.identity.fp;
     let conv = this.convs.get(env.conv);
-    if (conv && this.logs.get(env.conv).has(env.author, env.seq)) return { added: false, reason: 'duplicate' };
+    if (conv && this.logs.get(env.conv).has(streamOf(env), env.seq)) return { added: false, reason: 'duplicate' };
     if (typeof env.keys[me] !== 'string') return { added: false, reason: 'not addressed to us' };
     if (env.ts > this.now() + MAX_FUTURE_MS) return { added: false, reason: 'timestamp in the future' };
 
@@ -468,12 +493,20 @@ export class Engine extends EventTarget {
     let newConv = null;
     if (!conv) {
       if (env.conv.startsWith('d:')) {
-        if (!this.keyring.has(env.author) || env.author === me) return { added: false, reason: 'unknown author' };
-        if ((await directConvId(me, env.author)) !== env.conv) return { added: false, reason: 'bad direct id' };
-        const k = this.keyring.get(env.author);
+        // The other party is the author — or, for an op from one of our own other devices,
+        // whichever contact the conversation id belongs to.
+        let other = env.author === me ? null : env.author;
+        if (!other) {
+          for (const fp of this.keyring.keys()) {
+            if (fp !== me && (await directConvId(me, fp)) === env.conv) { other = fp; break; }
+          }
+        }
+        if (!other || !this.keyring.has(other)) return { added: false, reason: 'unknown author' };
+        if ((await directConvId(me, other)) !== env.conv) return { added: false, reason: 'bad direct id' };
+        const k = this.keyring.get(other);
         newConv = {
-          id: env.conv, kind: 'direct', members: [me, env.author].sort(),
-          memberCards: { [env.author]: { fp: env.author, card: k.card } }, createdAt: Date.now(), readUpTo: 0,
+          id: env.conv, kind: 'direct', members: [me, other].sort(),
+          memberCards: { [other]: { fp: other, card: k.card } }, createdAt: Date.now(), readUpTo: 0,
         };
       } else if (env.conv.startsWith('g:')) {
         newConv = await this._groupFromOp(env, body);
@@ -489,7 +522,7 @@ export class Engine extends EventTarget {
     if (!authorKey || !(await verifyOp(env, authorKey.signKey))) return { added: false, reason: 'bad signature' };
 
     const pinned = PINNED_TYPES.has(body.type);
-    if (!pinned && conv && env.seq <= this.logs.get(conv.id).floor(env.author)) return { added: false, reason: 'expired' };
+    if (!pinned && conv && env.seq <= this.logs.get(conv.id).floor(streamOf(env))) return { added: false, reason: 'expired' };
     // An expired op is still useful: it is a signed watermark that lets us skip that author's older history.
     const expired = !pinned && env.ts <= this._cutoff(c);
 
@@ -532,29 +565,87 @@ export class Engine extends EventTarget {
 
   // ------------------------------------------------------------ backup
 
-  async exportBackup(passphrase) {
-    const payload = {
+  /** Everything another device of ours needs (backups and device linking). Secret! */
+  async exportState() {
+    return {
+      v: 1,
       identity: await exportIdentity(this.identity),
       settings: this.settings,
       contacts: [...this.contacts.values()],
+      requests: [...this.requests.values()],
+      removed: this.removed,
+      nameAt: this.nameAt,
       convs: [...this.convs.values()],
       ops: [...this.logs.values()].flatMap((l) => l.since({})),
       mailboxes: Object.fromEntries(this.mailboxes),
+      mailSince: this.mailSince,
       exportedAt: Date.now(),
     };
-    return encryptBackup(payload, passphrase);
   }
 
-  async importBackup(file, passphrase) {
-    const data = await decryptBackup(file, passphrase);
+  /**
+   * Replace local storage with exported state. The device id is NOT imported: this
+   * installation keeps (or gets) its own, so its ops form a separate CRDT stream.
+   */
+  async importState(data) {
     await importIdentity(data.identity); // validate before touching storage
+    const device = await this.store.get('kv', 'device');
     await this.store.clear();
+    await this.store.put('kv', 'device', device || newDeviceId());
     await this.store.put('kv', 'identity', data.identity);
     await this.store.put('kv', 'settings', data.settings || DEFAULT_SETTINGS);
     for (const c of data.contacts || []) await this.store.put('contacts', c.fp, c);
+    for (const r of data.requests || []) await this.store.put('requests', r.fp, r);
     for (const c of data.convs || []) await this.store.put('convs', c.id, c);
     for (const env of data.ops || []) await this.store.put('ops', opKey(env), env);
     if (data.mailboxes) await this.store.put('kv', 'mailboxes', data.mailboxes);
+    if (data.removed) await this.store.put('kv', 'removed', data.removed);
+    if (data.nameAt) await this.store.put('kv', 'nameAt', data.nameAt);
+    if (data.mailSince) await this.store.put('kv', 'mailSince', data.mailSince);
+  }
+
+  async exportBackup(passphrase) {
+    return encryptBackup(await this.exportState(), passphrase);
+  }
+
+  async importBackup(file, passphrase) {
+    await this.importState(await decryptBackup(file, passphrase));
+  }
+
+  // ------------------------------------------------------------ our own other devices
+
+  /** Address book + profile, exchanged between our own devices on every connection. */
+  ownDeviceSummary() {
+    return {
+      name: this.identity.name, nameAt: this.nameAt,
+      contacts: [...this.contacts.values()].map(({ card, nick, nickAt, addedAt }) => ({ card, nick, nickAt, addedAt })),
+      removed: this.removed,
+      mailboxes: Object.fromEntries(this.mailboxes),
+    };
+  }
+
+  /** Merge another of our devices' summary. Add-wins per (addedAt vs removal time); LWW for names. */
+  async mergeOwnDevice(sum) {
+    if (!sum || typeof sum !== 'object') return;
+    if (typeof sum.name === 'string' && Number(sum.nameAt) > this.nameAt) await this.setName(sum.name, Number(sum.nameAt));
+    for (const [fp, at] of Object.entries(sum.removed || {})) {
+      const c = this.contacts.get(fp);
+      if (c && Number(at) > (c.addedAt || 0)) await this.removeContact(fp, Number(at));
+      else if (!c && Number(at) > (this.removed[fp] || 0)) { this.removed[fp] = Number(at); await this.store.put('kv', 'removed', this.removed); }
+    }
+    for (const r of (Array.isArray(sum.contacts) ? sum.contacts : []).slice(0, 5000)) {
+      let k;
+      try { k = await importCard(r.card); } catch { continue; }
+      if (k.fp === this.identity.fp) continue;
+      const addedAt = Number(r.addedAt) || 0;
+      if ((this.removed[k.fp] || 0) >= addedAt) continue;
+      const mine = this.contacts.get(k.fp);
+      if (!mine) await this.addContact(k.card, { addedAt, nick: String(r.nick || ''), nickAt: Number(r.nickAt) || 0 });
+      else if (Number(r.nickAt) > (mine.nickAt || 0)) await this.setNick(k.fp, String(r.nick || ''), Number(r.nickAt));
+    }
+    for (const [fp, list] of Object.entries(sum.mailboxes || {})) {
+      if (!this.mailboxes.has(fp)) await this.setPeerMailboxes(fp, list);
+    }
   }
 
   async wipe() {

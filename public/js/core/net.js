@@ -1,5 +1,9 @@
 // Network orchestration: presence over relays, WebRTC connection setup, manual
 // (serverless) connection codes, and live fan-out of new ops to connected peers.
+//
+// Connections are per *endpoint* — an identity on a device ("fp/dev"). One person may be
+// online on several devices; we connect to each, and our own devices connect to each other
+// through our own inbox to keep history and the address book in sync.
 
 import { Peer } from './peer.js';
 import { RelayPool, inboxTopic, utcDay, postMail, MAIL_KIND, MAIL_TTL_S } from './signaling.js';
@@ -16,7 +20,7 @@ export class Network extends EventTarget {
   constructor(engine) {
     super();
     this.engine = engine;
-    this.peers = new Map();   // fp -> ready Peer
+    this.peers = new Map();   // endpoint "fp/dev" -> ready Peer
     this.pending = new Map(); // sid -> Peer (connecting)
     this.lastHello = new Map();
     this.lastReply = new Map();
@@ -57,9 +61,25 @@ export class Network extends EventTarget {
     }
   }
 
-  isOnline(fp) { return this.peers.has(fp); }
+  /** Ready connections to any device of fp. */
+  devicesOf(fp) {
+    const out = [];
+    for (const p of this.peers.values()) if (p.fp === fp) out.push(p);
+    return out;
+  }
 
-  onlineCount() { return this.peers.size; }
+  isOnline(fp) { return this.devicesOf(fp).length > 0; }
+
+  /** Number of distinct other people we're connected to (own devices not counted). */
+  onlineCount() {
+    const me = this.engine.identity.fp;
+    return new Set([...this.peers.values()].map((p) => p.fp).filter((f) => f !== me)).size;
+  }
+
+  /** Our other devices that are connected right now. */
+  ownDevicesOnline() {
+    return this.devicesOf(this.engine.identity.fp).length;
+  }
 
   async _refreshTopics() {
     const d = utcDay();
@@ -85,12 +105,16 @@ export class Network extends EventTarget {
     } catch (e) { console.warn('signal failed', e); }
   }
 
-  /** Say hello to every known peer we're not connected to (they answer if online). */
+  /**
+   * Say hello to every known peer we're not connected to (each of their online devices
+   * answers), and to our own inbox so our other devices find us.
+   */
   async _presence(force = false) {
     if (!this.pool.status().connected) return;
     const now = Date.now();
-    for (const fp of this.engine.knownPeers()) {
-      if (this.peers.has(fp) || this._connecting(fp)) continue;
+    const me = this.engine.identity.fp;
+    for (const fp of [...this.engine.knownPeers(), me]) {
+      if (fp !== me && (this.isOnline(fp) || this._connecting(fp))) continue;
       const last = this.lastHello.get(fp) || 0;
       if (!force && now - last < HELLO_EVERY_MS) continue;
       if (force && now - last < 3000) continue;
@@ -99,12 +123,14 @@ export class Network extends EventTarget {
     }
   }
 
-  _hello() {
-    return { type: 'hello', mb: this.engine.settings.mailboxRelays || [] };
+  _hello(toDev) {
+    return { type: 'hello', dev: this.engine.device, toDev, mb: this.engine.settings.mailboxRelays || [] };
   }
 
-  _connecting(fp) {
-    for (const p of this.pending.values()) if (p.fp === fp && p.state === 'connecting') return true;
+  _connecting(fp, dev) {
+    for (const p of this.pending.values()) {
+      if (p.fp === fp && (!dev || p.dev === dev) && p.state === 'connecting') return true;
+    }
     return false;
   }
 
@@ -119,49 +145,58 @@ export class Network extends EventTarget {
 
     const fp = sender.fp;
     const me = this.engine.identity.fp;
-    debug('signal', payload.type, 'from', fp.slice(0, 8));
-    if (!this.engine.knownPeers().has(fp)) {
+    const myDev = this.engine.device;
+    const dev = String(payload.dev || '');
+    if (!/^[0-9a-f]{16}$/.test(dev)) return;
+    if (payload.toDev && payload.toDev !== myDev) return; // for another of our devices
+    if (fp === me && dev === myDev) return;               // our own echo
+    const ek = fp + '/' + dev;
+    debug('signal', payload.type, 'from', ek.slice(0, 8) + '…/' + dev.slice(0, 4));
+    if (fp !== me && !this.engine.knownPeers().has(fp)) {
       // Someone who has our card wants to connect: surface it as a contact request.
       if (payload.type === 'hello') await this.engine.addRequest(sender.card);
       return;
     }
-    this.engine.updatePeerCard(sender.card).catch(() => {});
-    if (payload.type === 'hello' && Array.isArray(payload.mb)) this.engine.setPeerMailboxes(fp, payload.mb).catch(() => {});
+    if (fp !== me) {
+      this.engine.updatePeerCard(sender.card).catch(() => {});
+      if (payload.type === 'hello' && Array.isArray(payload.mb)) this.engine.setPeerMailboxes(fp, payload.mb).catch(() => {});
+    }
+    const myEk = me + '/' + myDev;
 
     if (payload.type === 'hello') {
       // Peers only say hello when they are NOT connected to us, so a connection we still
       // think is open must be stale (e.g. they reloaded): drop it and reconnect.
-      const stale = this.peers.get(fp);
+      const stale = this.peers.get(ek);
       if (stale && Date.now() - stale.createdAt > 5000) stale.close();
       else if (stale) return;
       // Likewise an attempt that has been pending a while lost its offer/answer.
       for (const p of this.pending.values()) {
-        if (p.fp === fp && p.state === 'connecting' && Date.now() - p.createdAt > 8000) p.close();
+        if (p.fp === fp && p.dev === dev && p.state === 'connecting' && Date.now() - p.createdAt > 8000) p.close();
       }
-      if (this._connecting(fp)) return;
-      if (me < fp) {
-        debug('offering to', fp.slice(0, 8));
-        this._offer(fp);
+      if (this._connecting(fp, dev)) return;
+      if (myEk < ek) {
+        debug('offering to', ek.slice(0, 8));
+        this._offer(fp, dev);
       } else {
-        // The lower fingerprint always makes the offer, so there's no glare:
-        // just answer so they know we're online.
-        const last = this.lastReply.get(fp) || 0;
+        // The lower endpoint always makes the offer, so there's no glare:
+        // just answer (to that device only) so they know we're online.
+        const last = this.lastReply.get(ek) || 0;
         if (Date.now() - last > 2000) {
-          this.lastReply.set(fp, Date.now());
-          this._signal(fp, this._hello());
+          this.lastReply.set(ek, Date.now());
+          this._signal(fp, this._hello(dev));
         }
       }
     } else if (payload.type === 'offer' && typeof payload.sdp === 'string') {
-      if (me < fp) return; // we are supposed to be the offerer
-      for (const p of this.pending.values()) if (p.fp === fp) p.close();
-      const peer = this._newPeer({ initiator: false, expectedFp: fp, sid: String(payload.sid) });
+      if (myEk < ek) return; // we are supposed to be the offerer
+      for (const p of this.pending.values()) if (p.fp === fp && p.dev === dev) p.close();
+      const peer = this._newPeer({ initiator: false, expectedFp: fp, expectedDev: dev, sid: String(payload.sid) });
       try {
         const sdp = await peer.makeAnswer(payload.sdp);
-        this._signal(fp, { type: 'answer', sid: peer.sid, sdp });
+        this._signal(fp, { type: 'answer', dev: myDev, toDev: dev, sid: peer.sid, sdp });
       } catch (e) { peer.close(); }
     } else if (payload.type === 'answer' && typeof payload.sdp === 'string') {
       const peer = this.pending.get(String(payload.sid));
-      if (peer && peer.expectedFp === fp) peer.acceptAnswer(payload.sdp).catch(() => peer.close());
+      if (peer && peer.expectedFp === fp && peer.expectedDev === dev) peer.acceptAnswer(payload.sdp).catch(() => peer.close());
     }
   }
 
@@ -172,7 +207,7 @@ export class Network extends EventTarget {
     const c = this.engine.convs.get(conv);
     if (!c) return;
     for (const fp of c.members) {
-      if (fp === this.engine.identity.fp || this.peers.has(fp)) continue;
+      if (fp === this.engine.identity.fp || this.isOnline(fp)) continue;
       if (await this.engine.queueMail(fp, env)) this._flushMail(fp, true);
     }
   }
@@ -183,7 +218,7 @@ export class Network extends EventTarget {
 
   async _flushMail(fp, force = false) {
     if (this.mailing.has(fp)) return;
-    if (this.peers.has(fp)) return this.engine.clearMail(fp); // live sync covers it
+    if (this.isOnline(fp)) return this.engine.clearMail(fp); // live sync covers it
     const urls = this.engine.mailboxes.get(fp) || [];
     const k = this.engine.keyring.get(fp);
     if (!urls.length || !k) return;
@@ -226,12 +261,12 @@ export class Network extends EventTarget {
     if (added) this._emit('synced', { fp: sender.fp, added, via: 'mailbox' });
   }
 
-  async _offer(fp) {
-    const peer = this._newPeer({ initiator: true, expectedFp: fp });
+  async _offer(fp, dev) {
+    const peer = this._newPeer({ initiator: true, expectedFp: fp, expectedDev: dev });
     try {
       const sdp = await peer.makeOffer();
       if (peer.state === 'closed') return;
-      this._signal(fp, { type: 'offer', sid: peer.sid, sdp });
+      this._signal(fp, { type: 'offer', dev: this.engine.device, toDev: dev, sid: peer.sid, sdp });
     } catch (e) { debug('offer failed', e); peer.close(); }
   }
 
@@ -243,22 +278,24 @@ export class Network extends EventTarget {
     peer.addEventListener('ready', async () => {
       this.pending.delete(peer.sid);
       const fp = peer.remote.fp;
-      if (peer.manual && !this.engine.isContact(fp)) await this.engine.addContact(peer.remote.card);
-      this.engine.updatePeerCard(peer.remote.card).catch(() => {});
-      await this.engine.setPeerMailboxes(fp, peer.remoteMailboxes || []);
-      await this.engine.clearMail(fp); // direct sync supersedes anything queued
-      const old = this.peers.get(fp);
-      this.peers.set(fp, peer);
+      if (!peer.ownDevice) {
+        if (peer.manual && !this.engine.isContact(fp)) await this.engine.addContact(peer.remote.card);
+        this.engine.updatePeerCard(peer.remote.card).catch(() => {});
+        await this.engine.setPeerMailboxes(fp, peer.remoteMailboxes || []);
+        await this.engine.clearMail(fp); // direct sync supersedes anything queued
+      }
+      const old = this.peers.get(peer.ek);
+      this.peers.set(peer.ek, peer);
       if (old && old !== peer) old.close();
       peer.sendSync();
-      this._emit('peers', { fp, online: true });
+      this._emit('peers', { fp, online: true, own: peer.ownDevice });
     });
     peer.addEventListener('synced', (e) => this._emit('synced', { fp: peer.fp, ...e.detail }));
     peer.addEventListener('close', () => {
       this.pending.delete(peer.sid);
-      if (peer.remote && this.peers.get(peer.remote.fp) === peer) {
-        this.peers.delete(peer.remote.fp);
-        this._emit('peers', { fp: peer.remote.fp, online: false });
+      if (peer.remote && this.peers.get(peer.ek) === peer) {
+        this.peers.delete(peer.ek);
+        this._emit('peers', { fp: peer.remote.fp, online: this.isOnline(peer.remote.fp), own: peer.ownDevice });
         this.lastHello.delete(peer.remote.fp);
         setTimeout(() => this._presence(true), 1000);
       }
@@ -266,13 +303,16 @@ export class Network extends EventTarget {
     return peer;
   }
 
-  /** Push a newly stored op to every connected member of its conversation except the source. */
+  /**
+   * Push a newly stored op to every connected device of every member of its conversation
+   * (including our own other devices), except the endpoint it came from.
+   */
   _fanout({ env, conv, source }) {
     const c = this.engine.convs.get(conv);
     if (!c) return;
-    for (const fp of c.members) {
-      if (fp === source || fp === this.engine.identity.fp) continue;
-      this.peers.get(fp)?.sendOps([env]);
+    for (const peer of this.peers.values()) {
+      if (peer.ek === source || !c.members.includes(peer.fp)) continue;
+      peer.sendOps([env]);
     }
   }
 

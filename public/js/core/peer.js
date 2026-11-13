@@ -1,7 +1,7 @@
 // One WebRTC DataChannel to one peer, plus the authentication handshake and the
 // CRDT sync protocol that runs over it.
 //
-// Handshake: both sides send {t:'hi', card, nonce}; then each signs
+// Handshake: both sides send {t:'hi', card, dev, nonce}; then each signs
 //   "iwt-auth-v1|<peer nonce>|<own DTLS fingerprint>|<peer DTLS fingerprint>"
 // with its identity key. Binding the DTLS fingerprints proves no one is relaying
 // the channel in the middle, whatever path the offer/answer took.
@@ -39,13 +39,16 @@ function waitForIce(pc, ms = 4000) {
 export class Peer extends EventTarget {
   /**
    * @param engine
-   * @param opts {initiator, expectedFp?, manual?, iceServers, sid}
+   * @param opts {initiator, expectedFp?, expectedDev?, manual?, iceServers, sid}
    */
   constructor(engine, opts) {
     super();
     this.engine = engine;
     this.initiator = !!opts.initiator;
     this.expectedFp = opts.expectedFp || null;
+    this.expectedDev = opts.expectedDev || null;
+    this.dev = this.expectedDev;
+    this._rx = Promise.resolve();
     this.manual = !!opts.manual;
     this.sid = opts.sid || b64u(randomBytes(9));
     this.state = 'connecting';
@@ -68,6 +71,12 @@ export class Peer extends EventTarget {
   }
 
   get fp() { return this.remote?.fp || this.expectedFp; }
+
+  /** Endpoint key: one identity on one device. */
+  get ek() { return this.fp + '/' + this.dev; }
+
+  /** Is this a connection between two devices of the same identity? */
+  get ownDevice() { return this.fp === this.engine.identity.fp; }
 
   async makeOffer() {
     await this.pc.setLocalDescription(await this.pc.createOffer());
@@ -93,12 +102,14 @@ export class Peer extends EventTarget {
     dc.onopen = () => {
       if (this.helloSent) return;
       this.helloSent = true;
-      this._send({ t: 'hi', card: this.engine.identity.card(), nonce: this.nonce, mb: this.engine.settings.mailboxRelays || [] });
+      this._send({ t: 'hi', card: this.engine.identity.card(), dev: this.engine.device, nonce: this.nonce, mb: this.engine.settings.mailboxRelays || [] });
     };
     dc.onclose = () => this.close();
-    dc.onmessage = (e) => this._onMessage(e.data).catch((err) => {
-      console.warn('peer message error', err);
-    });
+    // Handle messages strictly in order (e.g. an address-book merge must finish before the
+    // ops that depend on it are ingested).
+    dc.onmessage = (e) => {
+      this._rx = this._rx.then(() => this._onMessage(e.data)).catch((err) => console.warn('peer message error', err));
+    };
     if (dc.readyState === 'open') dc.onopen();
   }
 
@@ -124,9 +135,14 @@ export class Peer extends EventTarget {
       if (this.remote) return;
       let k;
       try { k = await importCard(msg.card); } catch { return this.close(); }
+      const dev = String(msg.dev || '');
+      if (!/^[0-9a-f]{16}$/.test(dev)) return this.close();
       if (this.expectedFp && k.fp !== this.expectedFp) return this.close();
-      if (k.fp === this.engine.identity.fp) return this.close();
-      if (!this.manual && !this.engine.knownPeers().has(k.fp)) return this.close();
+      if (this.expectedDev && dev !== this.expectedDev) return this.close();
+      const me = this.engine.identity.fp;
+      if (k.fp === me && dev === this.engine.device) return this.close(); // ourselves
+      if (k.fp !== me && !this.manual && !this.engine.knownPeers().has(k.fp)) return this.close();
+      this.dev = dev;
       this.remote = k;
       this.remoteNonce = String(msg.nonce || '');
       this.remoteMailboxes = Array.isArray(msg.mb) ? msg.mb : [];
@@ -154,6 +170,12 @@ export class Peer extends EventTarget {
 
     if (!this.authed) return;
 
+    if (msg.t === 'mine' && this.ownDevice) {
+      // Another device of ours: merge address book and profile.
+      await this.engine.mergeOwnDevice(msg.summary);
+      return;
+    }
+
     if (msg.t === 'sync' && msg.convs && typeof msg.convs === 'object') {
       const shared = this.engine.sharedConvs(this.remote.fp);
       const batch = [];
@@ -171,7 +193,7 @@ export class Peer extends EventTarget {
         const conv = this.engine.convs.get(env?.conv);
         // Only accept ops for conversations the sender belongs to (or ones we're about to learn).
         if (conv && !conv.members.includes(this.remote.fp)) continue;
-        const r = await this.engine.ingest(env, this.remote.fp);
+        const r = await this.engine.ingest(env, this.ek);
         if (r.added) added++;
       }
       if (added) this.dispatchEvent(new CustomEvent('synced', { detail: { added } }));
@@ -181,6 +203,7 @@ export class Peer extends EventTarget {
 
   sendSync() {
     if (!this.authed) return;
+    if (this.ownDevice) this._send({ t: 'mine', summary: this.engine.ownDeviceSummary() });
     const convs = {};
     for (const id of this.engine.sharedConvs(this.remote.fp)) convs[id] = this.engine.vv(id);
     this._send({ t: 'sync', convs });

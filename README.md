@@ -33,8 +33,13 @@ Progressive Web App on GitHub Pages.
    (copy/paste or QR). This works on a local network with no internet.
 6. **Safety number** (tap a contact): compare it with your contact in person to rule out a
    swapped link.
-7. **Backup** (Settings): export an encrypted file (PBKDF2 + AES-GCM) to restore on another device.
-8. **Mailbox relays** (Settings, optional): list up to four Nostr relays that *you* run or trust.
+7. **Your other devices** (Settings → Link a new device): scan the QR code with your phone's camera
+   and it opens the app with your identity and full history. After that, your devices sync with
+   each other (messages, contacts, nicknames, display name), and contacts reach whichever devices
+   are online. You can also start on the new device from the welcome screen ("Link to my other
+   device").
+8. **Backup** (Settings): export an encrypted file (PBKDF2 + AES-GCM) to restore on another device.
+9. **Mailbox relays** (Settings, optional): list up to four Nostr relays that *you* run or trust.
    Your contacts learn them over the encrypted channel or from your contact link. They post
    encrypted messages there for you when you're offline (kept at most 7 days). Your app collects
    them when it opens. As an installed Chromium app it also checks in the background and shows a
@@ -126,6 +131,39 @@ Sync over a DataChannel works like this:
   identity keys, so a man-in-the-middle on signalling can't relay the channel, whatever path the
   SDP took.
 
+### Multiple devices per identity
+
+Every installation has a random **device id**, which is never copied. Ops are numbered per
+*stream* = identity + device, and the signed header carries `dev`. A phone and a laptop
+sharing one identity are therefore separate CRDT writers and never reuse a sequence number.
+Contacts still see one person: same fingerprint, same signing key.
+
+- **Connections are per device.** Relay signals carry the sender's device id and may target
+  one (`toDev`). Each of your online devices connects to each of your contacts' online
+  devices, and your own devices find each other through your own inbox topic.
+- **Your own devices sync everything.** Between them, sync covers every conversation. They
+  also exchange an address-book summary on each sync:
+  - contacts are add-wins against removal timestamps;
+  - nicknames and your display name are last-writer-wins.
+- **Fan-out.** New ops go to every connected device of every member, including your own.
+
+**Linking** (`js/core/link.js`):
+
+1. The existing device makes a one-time 128-bit secret *S*. It shows `…#link=<code>` as a QR
+   code; the code also carries the relay and STUN lists.
+2. Both devices derive four things from *S*:
+   - a relay topic;
+   - a key encrypting the WebRTC offer/answer;
+   - an HMAC key, used to prove knowledge of *S*, bound to both DTLS fingerprints;
+   - a key encrypting the transferred state.
+3. A man in the middle can neither find the rendezvous nor complete the proof.
+4. The state goes over the DataChannel in encrypted 32 KB chunks. The new device imports it
+   under its own device id.
+5. The code works once and expires after 5 minutes.
+
+Restoring a backup also creates a new device id, so a restored copy can run alongside the
+original.
+
 ### Offline mail and background checks
 
 Public relays only ever receive *ephemeral* events (kind 25050), which they forward but don't
@@ -183,8 +221,10 @@ symmetric NATs.
 - **Mailbox relays** you list can see when encrypted mail arrives for your inbox topic and how
   big it is. They can't see the sender, the content or your identity. Use relays you control.
 - **Background checks** happen only in installed Chromium apps, on the browser's schedule.
-- **One device per identity.** Running a restored backup alongside the original device at the same
-  time would reuse sequence numbers. Within one browser, a Web Lock lets only one tab run.
+- **A link code is as sensitive as your private key** for its 5-minute lifetime: anyone who opens
+  it first gets your identity. Within one browser, a Web Lock lets only one tab run.
+- **Device revocation isn't supported.** A lost device keeps the identity. The remedy is a new
+  identity; key rotation is future work.
 - **Equivocation.** A malicious member could sign two different ops with the same sequence number.
   Each replica keeps the first one it sees.
 - **Both peers must be online at the same time**, unless another member passes the updates along
@@ -196,11 +236,13 @@ symmetric NATs.
 
 ```bash
 npm install
-npm test               # unit tests: crypto, CRDT convergence, forgery rejection, BIP-340 vectors
+npm test               # unit tests: crypto, CRDT convergence, expiry, multi-device streams and
+                       # address-book merge, forgery rejection, BIP-340 vectors
 npm run test:e2e       # 3 Chromium users, a "public" relay and a user-owned mailbox relay:
                        # relay/manual WebRTC, offline catch-up, mailbox delivery while never online
                        # together, a background Periodic Sync wake-up with notification, group
-                       # gossip, convergence, and running with the web server shut down
+                       # gossip, linking an emulated phone from a QR link, phone and laptop chatting
+                       # as one identity, convergence, and running with the web server shut down
 npm run serve          # http://localhost:8080 (undeployed builds use network-first caching)
 ```
 
