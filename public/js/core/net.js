@@ -129,7 +129,16 @@ export class Network extends EventTarget {
     if (payload.type === 'hello' && Array.isArray(payload.mb)) this.engine.setPeerMailboxes(fp, payload.mb).catch(() => {});
 
     if (payload.type === 'hello') {
-      if (this.peers.has(fp) || this._connecting(fp)) return;
+      // Peers only say hello when they are NOT connected to us, so a connection we still
+      // think is open must be stale (e.g. they reloaded): drop it and reconnect.
+      const stale = this.peers.get(fp);
+      if (stale && Date.now() - stale.createdAt > 5000) stale.close();
+      else if (stale) return;
+      // Likewise an attempt that has been pending a while lost its offer/answer.
+      for (const p of this.pending.values()) {
+        if (p.fp === fp && p.state === 'connecting' && Date.now() - p.createdAt > 8000) p.close();
+      }
+      if (this._connecting(fp)) return;
       if (me < fp) {
         debug('offering to', fp.slice(0, 8));
         this._offer(fp);
@@ -229,7 +238,7 @@ export class Network extends EventTarget {
   // ------------------------------------------------------------ peers
 
   _newPeer(opts) {
-    const peer = new Peer(this.engine, { ...opts, iceServers: this.engine.settings.iceServers });
+    const peer = new Peer(this.engine, { timeoutMs: 20000, ...opts, iceServers: this.engine.settings.iceServers });
     this.pending.set(peer.sid, peer);
     peer.addEventListener('ready', async () => {
       this.pending.delete(peer.sid);

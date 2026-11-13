@@ -33,6 +33,7 @@ async function newUser(name, { relays = [`ws://127.0.0.1:${RELAY}`], mailbox = [
   await ctx.addInitScript(() => addEventListener('unhandledrejection', (e) => console.error('unhandled rejection:', String(e.reason?.stack || e.reason))));
   const page = await ctx.newPage();
   page.on('pageerror', (e) => console.error(`[${name}] pageerror`, e));
+  page.on('crash', () => console.error(`[${name}] page CRASHED`));
   page.on('console', (m) => { if (m.type() === 'error' || process.env.IWT_DEBUG) console.error(`[${name}]`, m.text()); });
   await page.goto(URL_);
   await page.waitForSelector('#onboard:not([hidden])');
@@ -62,6 +63,7 @@ const fp = (u) => u.page.evaluate(() => window.__iwt.engine.identity.fp);
 async function reopen(u) {
   u.page = await u.ctx.newPage();
   u.page.on('pageerror', (e) => console.error(`[${u.name}] pageerror`, e));
+  u.page.on('crash', () => console.error(`[${u.name}] page CRASHED`));
   u.page.on('console', (m) => { if (m.type() === 'error' || process.env.IWT_DEBUG) console.error(`[${u.name}]`, m.text()); });
   await u.page.goto(URL_);
   await u.page.waitForSelector('#main:not([hidden])');
