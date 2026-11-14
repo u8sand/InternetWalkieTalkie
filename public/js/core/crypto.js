@@ -263,6 +263,8 @@ export async function encryptBackup(obj, passphrase) {
 
 export async function decryptBackup(file, passphrase) {
   if (!file || file.format !== 'iwt-backup' || file.v !== 1) throw new Error('not a backup file');
+  // The work factor comes from the file: refuse values that would weaken or stall the restore.
+  if (!Number.isSafeInteger(file.iterations) || file.iterations < 100000 || file.iterations > 10000000) throw new Error('not a backup file');
   const base = await subtle.importKey('raw', utf8(passphrase), 'PBKDF2', false, ['deriveKey']);
   const key = await subtle.deriveKey(
     { name: 'PBKDF2', hash: 'SHA-256', salt: fromB64u(file.salt), iterations: file.iterations },

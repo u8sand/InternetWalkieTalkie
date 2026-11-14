@@ -86,6 +86,9 @@ self.addEventListener('fetch', (event) => {
 
 const MAIL_KIND = 4050;
 const MAIL_TTL_S = 7 * 86400;
+// Anyone holding the user's card can post to their mailbox, so bound what a wake-up stores.
+const MAX_INBOX = 500;              // events held for the app to process
+const MAX_EVENT_CHARS = 512 * 1024; // larger than any mail the app sends
 
 self.addEventListener('periodicsync', (event) => {
   if (event.tag === 'iwt-mailbox') event.waitUntil(checkMailbox());
@@ -130,7 +133,7 @@ function fetchRelay(url, filter, ms = 15000) {
     ws.onmessage = (m) => {
       let msg;
       try { msg = JSON.parse(m.data); } catch { return; }
-      if (msg[0] === 'EVENT' && msg[1] === sub && msg[2] && msg[2].kind === MAIL_KIND) events.push(msg[2]);
+      if (msg[0] === 'EVENT' && msg[1] === sub && msg[2] && msg[2].kind === MAIL_KIND && events.length < MAX_INBOX) events.push(msg[2]);
       if (msg[0] === 'EOSE' && msg[1] === sub) done();
     };
     ws.onerror = done;
@@ -153,10 +156,14 @@ async function checkMailbox() {
     const since = Math.max(floor, (bg.mailSince || 0) - 3600);
     const batches = await Promise.all(relays.map((u) => fetchRelay(u, { kinds: [MAIL_KIND], '#t': topics, since })));
     let fresh = 0;
+    let held = (await idb(db, 'inbox', 'readonly', (s) => s.count())) || 0;
     for (const ev of batches.flat()) {
-      if (typeof ev.id !== 'string' || typeof ev.content !== 'string') continue;
+      if (held >= MAX_INBOX) break;
+      if (typeof ev.id !== 'string' || ev.id.length > 64 || typeof ev.content !== 'string' || ev.content.length > MAX_EVENT_CHARS) continue;
       if (await idb(db, 'inbox', 'readonly', (s) => s.get(ev.id))) continue;
-      await idb(db, 'inbox', 'readwrite', (s) => s.put(ev, ev.id));
+      // Keep only the fields the app reads.
+      await idb(db, 'inbox', 'readwrite', (s) => s.put({ id: ev.id, kind: ev.kind, content: ev.content, created_at: ev.created_at }, ev.id));
+      held++;
       if (ev.created_at > (bg.mailSince || 0)) fresh++;
     }
     if (fresh && bg.notifications && self.Notification && Notification.permission === 'granted') {

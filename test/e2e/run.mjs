@@ -280,6 +280,8 @@ try {
   await send(carol, 'Carol here, via Alice');
   await openChatWith(bob, 'Walkie crew');
   await expectMsg(bob, 'Carol here, via Alice');
+  // Bob never met Carol: he is asked before his app would connect to her directly.
+  await bob.page.waitForSelector('#messages .notice:has-text("Carol")');
   await send(bob, 'Bob says hi to the group');
   await expectMsg(carol, 'Bob says hi to the group');
   // Carol (never connected to Bob) has the group open: her signed read receipt reaches Bob via Alice.
@@ -302,6 +304,9 @@ try {
   phone.page.on('pageerror', (e) => console.error('[Bob-phone] pageerror', e));
   phone.page.on('console', (m) => { if (m.type() === 'error' || process.env.IWT_DEBUG) console.error('[Bob-phone]', m.text()); });
   await phone.page.goto(linkUrl);                   // what scanning the QR code does
+  // Linking never starts by itself: the link must be confirmed on the new device.
+  await phone.page.waitForSelector('dialog :text("makes this device a copy")');
+  await phone.page.click('text=Link this device');
   await bob.page.waitForSelector('dialog :text("Linked. Your new device is ready.")', { timeout: 40000 });
   await shot(bob, '6-link-host');
   await phone.page.waitForSelector('#main:not([hidden])', { timeout: 20000 });

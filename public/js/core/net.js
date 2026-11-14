@@ -46,7 +46,10 @@ export class Network extends EventTarget {
     });
     engine.addEventListener('change', (e) => {
       if (e.detail.what === 'read') this._readChanged(e.detail);
-      if (e.detail.what === 'contacts') { this._refreshTopics(); this._presence(true); }
+      if (e.detail.what === 'contacts' || e.detail.what === 'convs') {
+        this._dropUnknown();
+        this._refreshTopics(); this._presence(true);
+      }
       // Just added someone from their link: if they're offline but have a mailbox,
       // leave the introduction there so they can accept us without being online together.
       if (e.detail.what === 'contacts' && e.detail.added && this.engine.contacts.get(e.detail.fp)?.invite) {
@@ -153,10 +156,23 @@ export class Network extends EventTarget {
   /** Someone presented our invite token: they got our link from us, so accept them. */
   async _acceptInvite(sender, payload) {
     if (!this.engine.checkInvite(payload.inv)) return false;
+    // The token is reusable, so it must not let back in someone the user removed.
+    if (this.engine.isBlocked(sender.fp)) return false;
     await this.engine.addContact(sender.card, { via: 'invite' });
     if (Array.isArray(payload.mb)) await this.engine.setPeerMailboxes(sender.fp, payload.mb);
     this._emit('invited', { fp: sender.fp });
     return true;
+  }
+
+  /** Hang up on anyone who is no longer a known peer (a removed contact, a declined group). */
+  _dropUnknown() {
+    const known = this.engine.knownPeers();
+    for (const p of [...this.peers.values(), ...this.pending.values()]) {
+      if (p.ownDevice || !p.fp || known.has(p.fp)) continue;
+      if (p.manual && !p.remote) continue; // a manual code still being exchanged
+      p.close();
+      this.engine.clearMail(p.fp).catch(() => {});
+    }
   }
 
   _connecting(fp, dev) {

@@ -25,9 +25,15 @@ const BATCH_BYTES = 48 * 1024;
 const RESYNC_MS = 60000;
 const debug = (...a) => { if (globalThis.IWT_DEBUG) console.log('[peer]', ...a); };
 
-function dtlsFingerprint(sdp) {
-  const m = /a=fingerprint:(\S+) (\S+)/i.exec(sdp || '');
-  return m ? (m[1].toLowerCase() + ' ' + m[2].toUpperCase()) : '';
+/**
+ * The DTLS certificate fingerprint an SDP commits to. Authentication signs this value, so it
+ * must be the one the browser actually enforces: an SDP naming more than one fingerprint
+ * (a decoy next to the real one) is refused outright rather than guessed at.
+ */
+export function dtlsFingerprint(sdp) {
+  const all = new Set();
+  for (const m of String(sdp || '').matchAll(/^a=fingerprint:(\S+) (\S+)\s*$/gim)) all.add(m[1].toLowerCase() + ' ' + m[2].toUpperCase());
+  return all.size === 1 ? [...all][0] : '';
 }
 
 function waitForIce(pc, ms = 4000) {
@@ -162,6 +168,7 @@ export class Peer extends EventTarget {
       this.remoteMailboxes = Array.isArray(msg.mb) ? msg.mb : [];
       const local = dtlsFingerprint(this.pc.localDescription?.sdp);
       const remote = dtlsFingerprint(this.pc.remoteDescription?.sdp);
+      if (!local || !remote) return this.close();
       const sig = await sign(this.engine.identity, authTranscript(this.remoteNonce, local, remote));
       this._send({ t: 'auth', sig: b64u(sig) });
       return;

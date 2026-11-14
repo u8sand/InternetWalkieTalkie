@@ -257,6 +257,16 @@ function attachmentNode(m) {
     }).catch(() => { n.building = false; });
     return n.el;
   }
+  // Large files from other people are fetched only when asked for.
+  if (engine.fileNeedsConsent(m)) {
+    n.el.replaceChildren(
+      kind === 'image' && file.thumb ? h('img', { class: 'att-img blur', src: file.thumb, alt: '', style: photoStyle(file) }) : null,
+      h('div', { class: 'att-file' },
+        h('span', { class: 'att-icon', text: '📄' }),
+        h('div', { class: 'grow' }, h('div', { class: 'att-name', text: file.name }), h('div', { class: 'att-meta', text: fmtSize(file.size) })),
+        h('button', { class: 'att-save', text: 'Download', onclick: () => { engine.wantFile(file.id); net.files.kick(); attachmentNode(m); } })));
+    return n.el;
+  }
   // Still fetching (or waiting for someone who has it to come online).
   const st = net.files.status(file.id);
   const pct = st ? Math.floor((st.have / st.total) * 100) : 0;
@@ -518,7 +528,7 @@ async function showContact(fp) {
     h('div', { class: 'row end', style: 'margin-top:1em' },
       hasHistory ? h('button', { class: 'danger', text: 'Delete chat', onclick: () => deleteChat(dc.id) }) : null,
       c ? h('button', { class: 'danger', text: 'Remove contact', onclick: async () => {
-        if (!confirm('Remove this contact? Your message history with them is kept (use Delete chat to remove it).')) return;
+        if (!confirm('Remove this contact? They will no longer be able to connect to you, message you or send you requests unless you add them again. Your message history with them is kept (use Delete chat to remove it).')) return;
         await engine.removeContact(fp); closeDialog(); render();
       } }) : h('button', { text: 'Add to contacts', onclick: async () => { await engine.addContact(k.card); closeDialog(); render(); } }),
       c ? h('button', { text: 'Save', onclick: async () => { await engine.setNick(fp, nick.value); closeDialog(); render(); } }) : null,
@@ -649,7 +659,7 @@ function showSettings() {
       pass,
       h('div', { class: 'row end', style: 'margin-top:.5em' },
         h('button', { text: 'Export backup', onclick: async () => {
-          if (pass.value.length < 8) return toast('Use a passphrase of at least 8 characters');
+          if (pass.value.length < 12) return toast('Use a passphrase of at least 12 characters (several random words work well)');
           const file = await engine.exportBackup(pass.value);
           const blob = new Blob([JSON.stringify(file)], { type: 'application/json' });
           const a = h('a', { href: URL.createObjectURL(blob), download: `walkie-talkie-backup-${new Date().toISOString().slice(0, 10)}.json` });
@@ -717,6 +727,7 @@ function showLinkJoin(prefill = '') {
       join = await LinkJoin.start(input.value);
     } catch (e) { status.textContent = e.message; return; }
     btn.disabled = true;
+    status.className = 'muted';
     status.textContent = 'Looking for your other device…';
     join.addEventListener('status', (e) => {
       const d = e.detail;
@@ -740,7 +751,12 @@ function showLinkJoin(prefill = '') {
     h('div', { class: 'row end', style: 'margin-top:.5em' }, scanButton((t) => { input.value = t; go(); }), btn),
     status, h('div', { class: 'progress' }, bar),
   );
-  if (prefill) go();
+  // Never start by itself: a link someone else sent would make this device a copy of THEIR
+  // identity, which they could then read along with.
+  if (prefill) {
+    status.className = 'small warn';
+    status.textContent = '⚠ This link makes this device a copy of another device\'s identity. Continue only if you just created it yourself on your own device (Settings → Link a new device). If someone sent it to you, close this: to chat with them you need their contact link instead.';
+  }
 }
 
 function showRestore() {
@@ -889,6 +905,21 @@ function renderChat() {
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const items = [];
   items.push(h('div', { class: 'sysmsg', text: `🔒 End-to-end encrypted, stored only on members' devices. Messages disappear after ${fmtRetention(engine.retentionDays(conv))}.` }));
+  const strangers = conv.kind === 'group' && conv.trusted === false ? engine.groupStrangers(conv) : [];
+  if (strangers.length) {
+    const names = strangers.slice(0, 5).map((fp) => engine.displayName(fp)).join(', ') + (strangers.length > 5 ? ` and ${strangers.length - 5} more` : '');
+    const convId = currentConv;
+    items.push(h('div', { class: 'notice' },
+      h('p', { text: `${engine.displayName(conv.createdBy)} added you to this group. ${strangers.length === 1 ? 'One member isn\'t' : strangers.length + ' members aren\'t'} in your contacts: ${names}. Messages reach you through the members you know. Connecting directly makes the group faster, and lets those members see when you're online and your network address.` }),
+      h('div', { class: 'row end' },
+        h('button', { class: 'danger', text: 'Leave group', onclick: async () => {
+          if (!confirm('Leave this group? Its messages are deleted from your devices and you will receive no more of them.')) return;
+          await engine.declineGroup(convId);
+          if (currentConv === convId) currentConv = null;
+          render();
+        } }),
+        h('button', { class: 'primary', text: 'Connect to all members', onclick: async () => { await engine.trustGroup(convId); render(); } }))));
+  }
   let lastDay = '', lastAuthor = null;
   for (const m of view.list()) {
     const day = fmtDay(m.ts);
@@ -1136,7 +1167,8 @@ async function startApp() {
   });
   setInterval(scheduleRender, 60000); // refresh relative day labels
   setInterval(() => engine.prune(), 3600000); // delete messages past their retention
-  window.__iwt = { engine, net }; // debugging handle (also used by the e2e test)
+  // Debugging handle (also used by the e2e test): local development only.
+  if (['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)) window.__iwt = { engine, net };
 }
 
 // ------------------------------------------------------------------ background mailbox checks
@@ -1263,4 +1295,9 @@ function fatal(e) {
     h('h1', { text: 'Something went wrong' }), h('p', { class: 'mono', text: String(e?.message || e) }))));
 }
 
-acquireLock();
+// The page can't forbid framing through a meta CSP, so refuse to run inside someone else's frame.
+if (window.top !== window.self) {
+  document.body.replaceChildren(h('div', { class: 'center-screen muted', text: 'Walkie-Talkie does not run inside another page. Open it in its own tab.' }));
+} else {
+  acquireLock();
+}

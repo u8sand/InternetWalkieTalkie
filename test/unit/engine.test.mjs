@@ -96,7 +96,11 @@ test('group: membership learned from signed create op, relayed via third member'
   await sync(a, c);
   assert.deepEqual(texts(c, g.id), ['hello group', 'from b']);
   assert.equal(c.views.get(g.id).name, 'Renamed');
-  assert.ok(c.knownPeers().has(b.identity.fp), 'C learns B as co-member');
+  // C doesn't connect to B (a stranger) until C approves the group.
+  assert.ok(!c.knownPeers().has(b.identity.fp), 'a co-member C never met is not a known peer yet');
+  assert.deepEqual(c.groupStrangers(c.convs.get(g.id)), [b.identity.fp]);
+  await c.trustGroup(g.id);
+  assert.ok(c.knownPeers().has(b.identity.fp), 'C learns B as co-member once the group is approved');
 });
 
 test('rejects forged, foreign and non-member ops', async () => {

@@ -122,6 +122,8 @@ mark { background: color-mix(in srgb, var(--warn) 45%, transparent); color: inhe
 .quote { background: var(--panel-2); border-left: 3px solid var(--accent); padding: .5em .8em; border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 30vh; overflow-y: auto; }
 .list.receipts { max-height: 40vh; border: 1px solid var(--line); border-radius: 8px; }
 .day { align-self: center; font-size: .75em; color: var(--muted); margin: 1em 0 .4em; }
+.notice { align-self: center; max-width: min(520px, 92%); margin: .4em 0 .8em; padding: .7em .9em; font-size: .9em; border: 1px solid var(--warn); border-radius: 8px; background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.notice p { margin: 0 0 .6em; }
 .sysmsg { align-self: center; font-size: .8em; color: var(--muted); margin: .6em 0; text-align: center; max-width: 80%; }
 #composer { display: flex; gap: .5em; padding: .6em; border-top: 1px solid var(--line); background: var(--panel); padding-bottom: max(.6em, env(safe-area-inset-bottom)); }
 #composer textarea { resize: none; max-height: 30vh; }

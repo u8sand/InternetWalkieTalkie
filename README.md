@@ -27,7 +27,9 @@ Progressive Web App on GitHub Pages.
    to approve, even if they've never used the app (setup tells them who invited them). If you
    have a mailbox relay, this works even while you're offline. To add someone else, open their
    link or scan their code. Settings → **Reset my contact link** invalidates links you've shared;
-   anyone using an old one only sends a contact request.
+   anyone using an old one only sends a contact request. **Removing a contact** cuts them off:
+   they can't connect to you, message you, reuse your link or send requests until you add them
+   again.
 3. Chat. The status pill shows how many relays you're connected to and how many peers are online.
    Messages you write while a contact is offline are stored locally and sync the next time you're
    both online.
@@ -42,19 +44,23 @@ Progressive Web App on GitHub Pages.
      **Delete chat** (tap the chat title) clears a whole conversation, e.g. with a contact you
      removed. The chat leaves your list until someone writes in it again.
    - **Search** (above the chat list) looks through every conversation on this device.
+   - Files over 5 MB from other people download only when you tap **Download**.
    - **Photos and files** (📎, paste, or drag and drop; up to 25 MB) are sent exactly as they are,
      metadata included: a photo's EXIF data (which may include where it was taken) goes with it.
      The message arrives like any other (by mailbox too, with a small blurred preview). The file
      itself downloads directly from whoever is connected and has it: the sender, any group member,
      or your own other device.
 4. **Groups**: any member who is online passes updates along to the others. So Bob and Carol can
-   sync through Alice even if they never connect directly.
+   sync through Alice even if they never connect directly. Only a contact can add you to a group.
+   If it has members you don't know, your app doesn't connect to them (or tell them you're
+   online) until you choose **Connect to all members**; **Leave group** drops it for good. A
+   member who isn't your contact can't message you directly: it arrives as a contact request.
 5. **Direct connection codes** (Settings): connect with no relay at all by swapping two codes
    (copy/paste or QR). This works on a local network with no internet.
 6. **Safety number** (tap a contact): compare it with your contact in person to rule out a
    swapped link.
-7. **Your other devices** (Settings → Link a new device): scan the QR code with your phone's camera
-   and it opens the app with your identity and full history. After that, your devices sync with
+7. **Your other devices** (Settings → Link a new device): scan the QR code with your phone's camera,
+   confirm on the phone, and it has your identity and full history. After that, your devices sync with
    each other (messages, contacts, nicknames, display name), and contacts reach whichever devices
    are online. You can also start on the new device from the welcome screen ("Link to my other
    device").
@@ -189,7 +195,8 @@ Sync over a DataChannel works like this:
 - **Channel authentication**: after the DataChannel opens, each side signs
   `nonce | own DTLS fingerprint | peer DTLS fingerprint`. This binds the WebRTC transport to the
   identity keys, so a man-in-the-middle on signalling can't relay the channel, whatever path the
-  SDP took.
+  SDP took. An SDP that names more than one fingerprint is refused, so the signed value is always
+  the one the browser enforces.
 
 ### Contact links and invites
 
@@ -279,8 +286,17 @@ symmetric NATs.
 ## Threat model and limitations
 
 - **Relays and networks** see that *someone* posted an encrypted blob to an inbox topic, plus the
-  timing and IP addresses. Anyone holding your contact card can work out your inbox topic. WebRTC
-  reveals IP addresses to the peers you connect to.
+  timing and IP addresses. Anyone holding your contact card can work out your inbox topic, and by
+  watching it on a relay can tell when you're online. While you're online, one relay session
+  posts to the topics of everyone you know, so a relay can see that set of topics together with
+  your IP address: a pseudonymous picture of your contact list, which anyone holding those
+  people's cards can map back to them. Use relays you trust, or direct connection codes. WebRTC
+  reveals IP addresses to the peers you connect to (contacts, and members of groups you approved).
+- **Keys are stored unencrypted in this browser profile**, readable by any script on the same
+  origin. On GitHub Pages every project site of one account shares the origin
+  `https://<user>.github.io`, so another site there (or an XSS hole in one) could read them.
+  **Serve the app from its own domain** (a custom domain in Settings → Pages, with nothing else
+  on it). Anyone with access to the unlocked device or profile has the identity too.
 - **Forward secrecy is partial.** Each op uses a fresh ephemeral key, but it's wrapped to the
   recipient's long-term ECDH key. If a device's keys are compromised, the history addressed to it
   can be decrypted. A double-ratchet layer would fix this.
@@ -293,7 +309,12 @@ symmetric NATs.
 - **Your contact link lets anyone who has it add you** without approval. That's the point of
   sharing it, but if it leaks, reset it.
 - **A link code is as sensitive as your private key** for its 5-minute lifetime: anyone who opens
-  it first gets your identity. Within one browser, a Web Lock lets only one tab run.
+  it first gets your identity. The reverse matters too: opening a link code someone *else* made
+  would turn a fresh device into a copy of their identity, so the app warns and never links
+  without confirmation.
+- **Limits against flooding**: at most 50 pending contact requests, 32 devices per member per
+  conversation, 500 mailbox events held by a background check; large files wait for a tap. A
+  contact can still send many ordinary messages. Within one browser, a Web Lock lets only one tab run.
 - **Device revocation isn't supported.** A lost device keeps the identity. The remedy is a new
   identity; key rotation is future work.
 - **Equivocation.** A malicious member could sign two different ops with the same sequence number.
@@ -331,5 +352,6 @@ notifications.
 2. In **Settings → Pages**, set **Source: GitHub Actions**.
 
 The workflow runs the unit tests, stamps `sw.js` with the commit SHA (so each deploy gets a new
-cache) and publishes `public/`. All paths are relative, so it works under
+cache) and publishes `public/`. Actions are pinned to commit SHAs, npm install scripts are off,
+and only the deploy job holds publishing rights. All paths are relative, so it works under
 `https://<user>.github.io/<repo>/`.

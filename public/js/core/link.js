@@ -17,6 +17,7 @@
 // that window could clone the identity, so the UI says so.
 
 import { RelayPool } from './signaling.js';
+import { dtlsFingerprint } from './peer.js';
 import { b64u, fromB64u, utf8, fromUtf8, hex, sha256, randomBytes, concat, pack, unpack, equalBytes } from './encoding.js';
 
 const subtle = globalThis.crypto.subtle;
@@ -44,20 +45,23 @@ async function open(key, blob) {
   return JSON.parse(fromUtf8(new Uint8Array(await subtle.decrypt({ name: 'AES-GCM', iv: b.subarray(0, 12) }, key, b.subarray(12)))));
 }
 
-function dtls(sdp) {
-  const m = /a=fingerprint:(\S+) (\S+)/i.exec(sdp || '');
-  return m ? m[1].toLowerCase() + ' ' + m[2].toUpperCase() : '';
+/** Both DTLS fingerprints, or throws if either SDP doesn't commit to exactly one. */
+function fingerprints(pc) {
+  const local = dtlsFingerprint(pc.localDescription?.sdp);
+  const remote = dtlsFingerprint(pc.remoteDescription?.sdp);
+  if (!local || !remote) throw new Error('ambiguous DTLS fingerprint');
+  return { local, remote };
 }
 
 async function proof(keys, role, pc) {
-  const msg = 'iwt-link-proof|' + role + '|' + dtls(pc.localDescription?.sdp) + '|' + dtls(pc.remoteDescription?.sdp);
-  return new Uint8Array(await subtle.sign('HMAC', keys.mac, utf8(msg)));
+  const { local, remote } = fingerprints(pc);
+  return new Uint8Array(await subtle.sign('HMAC', keys.mac, utf8('iwt-link-proof|' + role + '|' + local + '|' + remote)));
 }
 
 async function expectedProof(keys, role, pc) {
   // What the other side computes: its own DTLS fp is our remote one.
-  const msg = 'iwt-link-proof|' + role + '|' + dtls(pc.remoteDescription?.sdp) + '|' + dtls(pc.localDescription?.sdp);
-  return new Uint8Array(await subtle.sign('HMAC', keys.mac, utf8(msg)));
+  const { local, remote } = fingerprints(pc);
+  return new Uint8Array(await subtle.sign('HMAC', keys.mac, utf8('iwt-link-proof|' + role + '|' + remote + '|' + local)));
 }
 
 function waitIce(pc, ms = 4000) {
@@ -155,7 +159,8 @@ export class LinkHost extends LinkBase {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
       if (msg.t === 'proof') {
-        const ok = equalBytes(fromB64u(msg.mac), await expectedProof(this.keys, 'join', this.pc));
+        let ok = false;
+        try { ok = equalBytes(fromB64u(msg.mac), await expectedProof(this.keys, 'join', this.pc)); } catch {}
         if (!ok) return this._fail('The other device could not prove it holds the link code.');
         this._send({ t: 'proof', mac: b64u(await proof(this.keys, 'host', this.pc)) });
         await this._sendState();
@@ -227,12 +232,15 @@ export class LinkJoin extends LinkBase {
     this.dc = dc;
     const parts = [];
     let expected = 0, size = 0, verified = false;
-    dc.onopen = async () => this._send({ t: 'proof', mac: b64u(await proof(this.keys, 'join', this.pc)) });
+    dc.onopen = async () => {
+      try { this._send({ t: 'proof', mac: b64u(await proof(this.keys, 'join', this.pc)) }); }
+      catch { this._fail('Could not verify the connection to the other device.'); }
+    };
     dc.onmessage = async (e) => {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
       if (msg.t === 'proof') {
-        verified = equalBytes(fromB64u(msg.mac), await expectedProof(this.keys, 'host', this.pc));
+        try { verified = equalBytes(fromB64u(msg.mac), await expectedProof(this.keys, 'host', this.pc)); } catch { verified = false; }
         if (!verified) return this._fail('The other device could not prove it created this code.');
         this._status('receiving', { progress: 0 });
       } else if (!verified) {

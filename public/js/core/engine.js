@@ -38,6 +38,10 @@ export const clampRetention = (d) => (Number.isSafeInteger(d) && d >= 1 && d <= 
 const MAX_FUTURE_MS = DAY_MS; // tolerated clock skew for op timestamps
 const STREAM_RE = /^[0-9a-f]{40}\/[0-9a-f]{16}$/;
 const MAX_FORGET_IDS = 5000;
+const MAX_REQUESTS = 50;            // pending contact requests kept; further ones are dropped
+const MAX_STREAMS_PER_AUTHOR = 32;  // devices one member may write from in one conversation
+// Attachments larger than this from other people are fetched only once the user asks.
+export const AUTO_FETCH_BYTES = 5 * 1024 * 1024;
 
 /** Header-only copy of an op: keeps its place in the version vector, holds no content. */
 const stubOf = (env) => ({ v: env.v, conv: env.conv, author: env.author, dev: env.dev, seq: env.seq, lamport: env.lamport, ts: env.ts, stub: true });
@@ -106,6 +110,7 @@ export class Engine extends EventTarget {
     this.forgets = new Map();
     this.seen = {};             // fp -> ms: when we were last connected to them
     this.chunks = new Map();    // file id -> Set<index> of encrypted chunks we hold
+    this.wanted = new Set();    // file ids the user asked to download (large files aren't fetched unasked)
     this._fileKeys = new Map(); // file id -> CryptoKey
     this.relayRcpt = new Map(); // group conv -> {fp -> signed receipt}: passed on to members who can't reach fp
     this.now = () => Date.now(); // overridable clock (tests)
@@ -266,12 +271,48 @@ export class Engine extends EventTarget {
 
   isContact(fp) { return this.contacts.has(fp); }
 
-  /** Peers we are willing to open connections with: contacts + members of our groups. */
+  /**
+   * Peers we are willing to open connections with: our contacts, plus the members of groups
+   * we trust (ones we made, ones whose members are all contacts, or ones the user approved).
+   * A direct chat alone grants nothing, so removing a contact cuts them off; and being put in
+   * a group with strangers doesn't expose us to them until the user says so.
+   */
   knownPeers() {
     const out = new Set(this.contacts.keys());
-    for (const conv of this.convs.values()) for (const m of conv.members) out.add(m);
+    for (const conv of this.convs.values()) {
+      if (conv.kind !== 'group' || conv.declined || conv.trusted === false) continue;
+      for (const m of conv.members) if (!this.removed[m]) out.add(m);
+    }
     out.delete(this.identity.fp);
     return out;
+  }
+
+  /** Removed contacts stay cut off until the user adds them again. */
+  isBlocked(fp) { return !!this.removed[fp] && !this.contacts.has(fp); }
+
+  /** Members of a group who aren't our contacts (we don't connect to them until the group is trusted). */
+  groupStrangers(conv) {
+    return conv.members.filter((m) => m !== this.identity.fp && !this.contacts.has(m));
+  }
+
+  /** The user approved connecting directly to every member of this group. */
+  async trustGroup(convId) {
+    const conv = this.convs.get(convId);
+    if (!conv || conv.kind !== 'group' || conv.trusted === true) return;
+    conv.trusted = true;
+    await this.store.put('convs', convId, conv);
+    this._emit('change', { what: 'convs' });
+  }
+
+  /** Refuse a group: its history is dropped here and nothing more is accepted or synced for it. */
+  async declineGroup(convId) {
+    const conv = this.convs.get(convId);
+    if (!conv || conv.kind !== 'group' || conv.declined) return;
+    conv.declined = true;
+    conv.trusted = false;
+    await this.store.put('convs', convId, conv);
+    await this.clearConv(convId, { hide: true });
+    this._emit('change', { what: 'convs' });
   }
 
   /**
@@ -396,7 +437,9 @@ export class Engine extends EventTarget {
   async addRequest(card) {
     const k = await importCard(card);
     if (this.contacts.has(k.fp) || k.fp === this.identity.fp) return false;
+    if (this.removed[k.fp]) return false; // someone we removed can't ask again
     const isNew = !this.requests.has(k.fp);
+    if (isNew && this.requests.size >= MAX_REQUESTS) return false;
     const r = { fp: k.fp, card: k.card, at: Date.now() };
     this.requests.set(k.fp, r);
     await this.store.put('requests', k.fp, r);
@@ -443,6 +486,7 @@ export class Engine extends EventTarget {
 
   conversations() {
     return [...this.convs.values()].filter((conv) => {
+      if (conv.declined) return false;
       // A deleted chat stays out of the list until a new message arrives.
       return !this.forgets.get(conv.id)?.hide || this.views.get(conv.id).list().length > 0;
     }).map((conv) => {
@@ -707,7 +751,7 @@ export class Engine extends EventTarget {
     const out = [];
     for (const [conv, view] of this.views) {
       for (const msg of view.messages.values()) {
-        if (!msg.file) continue;
+        if (!msg.file || this.fileNeedsConsent(msg)) continue;
         const n = chunkCount(msg.file.size);
         const have = this.chunks.get(msg.file.id);
         if (!have || have.size < n) out.push({ conv, file: msg.file, missing: [...Array(n).keys()].filter((i) => !have?.has(i)) });
@@ -715,6 +759,19 @@ export class Engine extends EventTarget {
     }
     return out;
   }
+
+  /**
+   * Large files from other people wait for the user to ask, so a contact can't fill this
+   * device's storage. Our own files (from another of our devices) and downloads already
+   * under way are fetched without asking.
+   */
+  fileNeedsConsent(msg) {
+    const f = msg.file;
+    return !!f && f.size > AUTO_FETCH_BYTES && msg.author !== this.identity.fp
+      && !this.wanted.has(f.id) && !this.chunks.get(f.id)?.size;
+  }
+
+  wantFile(id) { this.wanted.add(id); }
 
   /** May peer `fp` (an identity) receive this file? Members of its conversation, or our own devices. */
   canServe(id, fp) {
@@ -837,7 +894,7 @@ export class Engine extends EventTarget {
       const id = await groupConvId(this.identity.fp, nonce);
       const memberCards = {};
       for (const m of members) memberCards[m] = { fp: m, card: this.keyring.get(m).card };
-      const conv = { id, kind: 'group', members: members.sort(), memberCards, createdBy: this.identity.fp, createdAt: Date.now(), readUpTo: 0, retentionDays };
+      const conv = { id, kind: 'group', members: members.sort(), memberCards, createdBy: this.identity.fp, createdAt: Date.now(), readUpTo: 0, retentionDays, trusted: true };
       this._registerConv(conv);
       await this.store.put('convs', id, conv);
       await this._send(id, {
@@ -892,7 +949,7 @@ export class Engine extends EventTarget {
 
   /** Conversations a given peer is a member of (the only ones we ever tell them about). */
   sharedConvs(fp) {
-    return [...this.convs.values()].filter((c) => c.members.includes(fp)).map((c) => c.id);
+    return [...this.convs.values()].filter((c) => !c.declined && c.members.includes(fp)).map((c) => c.id);
   }
 
   vv(convId) {
@@ -917,6 +974,9 @@ export class Engine extends EventTarget {
     if (env.lamport > this.clock + 1e6) return { added: false, reason: 'lamport out of range' };
     const me = this.identity.fp;
     let conv = this.convs.get(env.conv);
+    if (conv?.declined) return { added: false, reason: 'declined' };
+    // Ops passed on by another of our own devices were already vetted there.
+    const fromOwn = typeof source === 'string' && source.startsWith(me + '/');
     if (conv && this.logs.get(env.conv).has(streamOf(env), env.seq)) return { added: false, reason: 'duplicate' };
     if (typeof env.keys[me] !== 'string') return { added: false, reason: 'not addressed to us' };
     if (env.ts > this.now() + MAX_FUTURE_MS) return { added: false, reason: 'timestamp in the future' };
@@ -946,6 +1006,8 @@ export class Engine extends EventTarget {
       } else if (env.conv.startsWith('g:')) {
         newConv = await this._groupFromOp(env, body);
         if (!newConv) return { added: false, reason: 'unknown group' };
+        // Only someone we know can put us in a group.
+        if (env.author !== me && !fromOwn && !this.contacts.has(env.author)) return { added: false, reason: 'group from a non-contact' };
       } else {
         return { added: false, reason: 'bad conv id' };
       }
@@ -955,6 +1017,21 @@ export class Engine extends EventTarget {
     if (body.type === 'group' && (env.author !== c.createdBy || env.seq !== 1)) return { added: false, reason: 'forged group op' };
     const authorKey = newConv?._keys?.get(env.author) || this.keyring.get(env.author);
     if (!authorKey || !(await verifyOp(env, authorKey.signKey))) return { added: false, reason: 'bad signature' };
+
+    // A direct chat needs a contact: someone we removed is cut off, and someone we only share
+    // a group with has to ask first (their message is resent by sync once we accept).
+    if (c.kind === 'direct' && env.author !== me && !fromOwn && !this.contacts.has(env.author)) {
+      await this.addRequest(authorKey.card).catch(() => {});
+      return { added: false, reason: 'not a contact' };
+    }
+    // A member can't flood a conversation with made-up device streams.
+    const st = streamOf(env);
+    const held = conv && this.logs.get(conv.id);
+    if (held && !held.byAuthor.has(st)) {
+      let n = 0;
+      for (const k of held.byAuthor.keys()) if (k.startsWith(env.author + '/')) n++;
+      if (n >= MAX_STREAMS_PER_AUTHOR) return { added: false, reason: 'too many devices' };
+    }
 
     const pinned = PINNED_TYPES.has(body.type);
     if (!pinned && conv && env.seq <= this.logs.get(conv.id).floor(streamOf(env))) return { added: false, reason: 'expired' };
@@ -999,6 +1076,8 @@ export class Engine extends EventTarget {
       id: env.conv, kind: 'group', members: [...keys.keys()].sort(), memberCards,
       createdBy: env.author, createdAt: Date.now(), readUpTo: 0, _keys: keys,
       retentionDays: clampRetention(body.retentionDays),
+      // Until the user approves, we don't connect to members who aren't our contacts.
+      trusted: [...keys.keys()].every((fp) => fp === me || this.contacts.has(fp)),
     };
   }
 
@@ -1070,6 +1149,8 @@ export class Engine extends EventTarget {
       reads: Object.fromEntries([...this.convs.values()].filter((c) => c.readUpTo).map((c) => [c.id, c.readUpTo])),
       receipts: Object.fromEntries(this.receipts),
       forgets: Object.fromEntries([...this.forgets].map(([c, f]) => [c, { upTo: f.upTo, ids: [...f.ids], hide: f.hide }])),
+      groups: Object.fromEntries([...this.convs.values()].filter((c) => c.kind === 'group' && (c.declined || c.trusted === true))
+        .map((c) => [c.id, c.declined ? 'declined' : 'trusted'])),
     };
   }
 
@@ -1104,6 +1185,10 @@ export class Engine extends EventTarget {
     }
     for (const [conv, byFp] of Object.entries(sum.receipts || {})) {
       for (const [fp, r] of Object.entries(byFp || {})) await this.noteReceipt(conv, fp, r || {});
+    }
+    for (const [conv, state] of Object.entries(sum.groups || {})) {
+      if (state === 'declined') await this.declineGroup(conv);
+      else if (state === 'trusted' && !this.convs.get(conv)?.declined) await this.trustGroup(conv);
     }
     await this._serial(async () => {
       for (const [conv, f] of Object.entries(sum.forgets || {})) {
