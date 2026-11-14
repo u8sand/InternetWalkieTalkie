@@ -394,8 +394,19 @@ try {
   // check shape instead, plus long markers that can't occur by chance.)
   for (const ev of relay.stats.log.map((l) => JSON.parse(l))) {
     assert.match(ev.content, /^[A-Za-z0-9_-]+$/, 'content is a single opaque base64url blob');
-    assert.deepEqual(ev.tags.map((t) => t[0]), ['t'], 'only a topic tag');
-    assert.match(ev.tags[0][1], /^[0-9a-f]{32}$/, 'topic is a hash');
+    assert.ok(ev.tags.length >= 1 && ev.tags.length <= 2, 'one topic, or two while introducing ourselves');
+    for (const t of ev.tags) {
+      assert.equal(t[0], 't', 'only topic tags');
+      assert.match(t[1], /^[0-9a-f]{32}$/, 'topic is a hash');
+    }
+  }
+  // No topic can be worked out from a contact card: the old fingerprint-derived inbox topics are gone.
+  {
+    const day = Math.floor(Date.now() / 86400000);
+    const seen = new Set(relay.stats.log.flatMap((l) => JSON.parse(l).tags.map((t) => t[1])));
+    for (const f of [aliceFp, bobFp]) for (const d of [day - 1, day, day + 1]) {
+      assert.ok(!seen.has(createHash('sha256').update(`iwt-inbox-v1|${f}|${d}`).digest('hex').slice(0, 32)), 'no card-derived topic on the relay');
+    }
   }
   for (const needle of [aliceFp, bobFp, 'a=fingerprint', 'candidate:', '"type":"hello"', '"card"']) {
     assert.ok(!wire.includes(needle), `relay saw "${needle}"`);

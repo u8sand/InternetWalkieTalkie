@@ -6,7 +6,8 @@
 // through our own inbox to keep history and the address book in sync.
 
 import { Peer } from './peer.js';
-import { RelayPool, inboxTopic, utcDay, postMail, MAIL_KIND, MAIL_TTL_S } from './signaling.js';
+import { RelayPool, postMail, MAIL_KIND, MAIL_TTL_S } from './signaling.js';
+import { utcDay, liveTopic, mailTopic, introTopic, introMailTopic } from './topics.js';
 import { sealSignal, openSignal } from './crypto.js';
 import { pack, unpack } from './encoding.js';
 import { opKey } from './engine.js';
@@ -46,9 +47,11 @@ export class Network extends EventTarget {
     });
     engine.addEventListener('change', (e) => {
       if (e.detail.what === 'read') this._readChanged(e.detail);
+      if (e.detail.what === 'invite') this._refreshTopics();
       if (e.detail.what === 'contacts' || e.detail.what === 'convs') {
         this._dropUnknown();
-        this._refreshTopics(); this._presence(true);
+        // Listen on their topic before saying hello, so the reply isn't missed.
+        this._refreshTopics().then(() => this._presence(true)).catch(() => {});
       }
       // Just added someone from their link: if they're offline but have a mailbox,
       // leave the introduction there so they can accept us without being online together.
@@ -106,16 +109,50 @@ export class Network extends EventTarget {
     return this.devicesOf(this.engine.identity.fp).length;
   }
 
+  /**
+   * Subscribe to every topic someone may use to reach us: one per person we hold keys for
+   * (and one for our own devices), plus the intro topics of our contact link. Yesterday's and
+   * tomorrow's live topics are included to tolerate clock skew.
+   */
   async _refreshTopics() {
+    const e = this.engine;
+    const me = e.identity.fp;
     const d = utcDay();
-    const fp = this.engine.identity.fp;
-    const days = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
-    const live = await Promise.all(days(d - 1, d + 1).map((x) => inboxTopic(fp, x)));
-    const mail = await Promise.all(days(d - 8, d + 1).map((x) => inboxTopic(fp, x)));
+    const days = [d - 1, d, d + 1];
+    if (this._topicDay !== d) { this._topicDay = d; this._liveCache = new Map(); }
+    const cached = async (k, make) => {
+      let t = this._liveCache.get(k);
+      if (!t) { t = await make(); this._liveCache.set(k, t); }
+      return t;
+    };
+    const live = [];
+    for (const fp of [me, ...e.reachable()]) {
+      const key = await e.pairKey(fp);
+      for (const day of days) live.push(await cached(fp + '|' + day, () => liveTopic(key, day)));
+    }
+    for (const tok of e.inviteTokens()) {
+      for (const day of days) live.push(await cached('i|' + tok + '|' + day, () => introTopic(me, tok, day)));
+    }
+    const mail = await e.myMailTopics();
     const floor = Math.floor(Date.now() / 1000) - MAIL_TTL_S;
     // Re-read a little before the newest mail we saw, to tolerate relay clock skew.
-    const since = Math.max(floor, (this.engine.mailSince || 0) - 3600);
+    const since = Math.max(floor, (e.mailSince || 0) - 3600);
     this.pool.setTopics(live, mail, since);
+    // The service worker checks the same mail topics in the background.
+    if (mail.join() !== this._bgMail) { this._bgMail = mail.join(); await e._saveBackgroundConfig(); }
+  }
+
+  /**
+   * Where to post for fp: the topic only the two of us can compute, plus (while they may not
+   * know us yet) the intro topic of the contact link we added them from.
+   */
+  async _topicsFor(fp, mail = false) {
+    const key = await this.engine.pairKey(fp);
+    if (!key) return [];
+    const out = [await (mail ? mailTopic(key) : liveTopic(key))];
+    const inv = this.engine.contacts.get(fp)?.invite;
+    if (inv) out.push(await (mail ? introMailTopic(fp, inv) : introTopic(fp, inv)));
+    return out;
   }
 
   // ------------------------------------------------------------ relay signalling
@@ -126,7 +163,7 @@ export class Network extends EventTarget {
     try {
       debug('send', payload.type, 'to', fp.slice(0, 8));
       const blob = await sealSignal(this.engine.identity, k, payload);
-      await this.pool.publish(await inboxTopic(fp), blob);
+      await this.pool.publish(await this._topicsFor(fp), blob);
     } catch (e) { console.warn('signal failed', e); }
   }
 
@@ -288,7 +325,7 @@ export class Network extends EventTarget {
         }
         const inv = this.engine.contacts.get(fp)?.invite;
         const blob = await sealSignal(this.engine.identity, k, { type: 'mail', ops: batch, ...(inv ? { inv, mb: this.engine.settings.mailboxRelays || [] } : {}) });
-        const acked = await postMail(urls, await inboxTopic(fp), blob);
+        const acked = await postMail(urls, await this._topicsFor(fp, true), blob);
         debug('mailed', batch.length, 'ops to', fp.slice(0, 8), 'acked by', acked);
         if (!acked) break; // their relay is unreachable: retry later
         await this.engine.clearMail(fp, batch.map(opKey));
@@ -306,7 +343,7 @@ export class Network extends EventTarget {
     if (!urls.length || !k || !inv || this.isOnline(fp)) return;
     try {
       const blob = await sealSignal(this.engine.identity, k, { type: 'mail', ops: [], inv, mb: this.engine.settings.mailboxRelays || [] });
-      debug('introduced to', fp.slice(0, 8), 'acked by', await postMail(urls, await inboxTopic(fp), blob));
+      debug('introduced to', fp.slice(0, 8), 'acked by', await postMail(urls, await this._topicsFor(fp, true), blob));
     } catch (e) { debug('introduce failed', e); }
   }
 
@@ -456,7 +493,7 @@ export class Network extends EventTarget {
       for (const id of convs) payload[id] = this.engine.myReceipt(id);
       try {
         const blob = await sealSignal(this.engine.identity, k, { type: 'rcpt', convs: payload });
-        if (await postMail(urls, await inboxTopic(fp), blob)) this.rcptMail.delete(fp);
+        if (await postMail(urls, await this._topicsFor(fp, true), blob)) this.rcptMail.delete(fp);
       } catch (e) { debug('receipt mail failed', e); }
     }
   }

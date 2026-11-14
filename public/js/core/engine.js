@@ -4,8 +4,9 @@
 
 import {
   generateIdentity, importIdentity, exportIdentity, importCard, sealOp, openOp, verifyOp,
-  isWellFormedOp, encryptBackup, decryptBackup, sign, verify,
+  isWellFormedOp, encryptBackup, decryptBackup, sign, verify, pairKey,
 } from './crypto.js';
+import { mailTopic, introMailTopic } from './topics.js';
 import { OpLog, ConversationView, msgId, streamOf, PINNED_TYPES } from './crdt.js';
 import { utf8, hex, sha256, b64u, fromB64u, randomBytes, canonical } from './encoding.js';
 import {
@@ -13,7 +14,11 @@ import {
 } from './files.js';
 
 const newDeviceId = () => hex(randomBytes(8));
-const newInvite = () => ({ token: b64u(randomBytes(16)), at: Date.now() });
+const MAX_OLD_INVITES = 3; // retired link tokens we still listen for (they only produce contact requests)
+const newInvite = (prev) => ({
+  token: b64u(randomBytes(16)), at: Date.now(),
+  old: prev ? [prev.token, ...(prev.old || [])].slice(0, MAX_OLD_INVITES) : [],
+});
 const INVITE_RE = /^[A-Za-z0-9_-]{16,43}$/;
 
 export const DEFAULT_SETTINGS = {
@@ -112,6 +117,7 @@ export class Engine extends EventTarget {
     this.chunks = new Map();    // file id -> Set<index> of encrypted chunks we hold
     this.wanted = new Set();    // file ids the user asked to download (large files aren't fetched unasked)
     this._fileKeys = new Map(); // file id -> CryptoKey
+    this._pairKeys = new Map(); // fp -> key shared with them (relay topics derive from it)
     this.relayRcpt = new Map(); // group conv -> {fp -> signed receipt}: passed on to members who can't reach fp
     this.now = () => Date.now(); // overridable clock (tests)
     this._queue = Promise.resolve();
@@ -190,10 +196,43 @@ export class Engine extends EventTarget {
     return true;
   }
 
+  /**
+   * The key we share with fp alone (static ECDH); relay topics for the two of us derive from
+   * it. With our own fingerprint it is the key our own devices share.
+   */
+  async pairKey(fp) {
+    let k = this._pairKeys.get(fp);
+    if (!k) {
+      const peer = this.keyring.get(fp);
+      if (!peer) return null;
+      k = await pairKey(this.identity, peer.dhKey);
+      this._pairKeys.set(fp, k);
+    }
+    return k;
+  }
+
+  /** Everyone whose signals and mail we listen for: all keys we hold, minus people we removed. */
+  reachable() {
+    return [...this.keyring.keys()].filter((fp) => fp !== this.identity.fp && !this.isBlocked(fp));
+  }
+
+  /** Link tokens we listen for: the current one, then retired ones. */
+  inviteTokens() {
+    return this.invite ? [this.invite.token, ...(this.invite.old || [])] : [];
+  }
+
+  /** Topics on our mailbox relays where mail for us may wait. */
+  async myMailTopics() {
+    const out = [];
+    for (const fp of this.reachable()) out.push(await mailTopic(await this.pairKey(fp)));
+    for (const t of this.inviteTokens()) out.push(await introMailTopic(this.identity.fp, t));
+    return out.sort();
+  }
+
   /** Plain, non-secret settings the service worker needs for background mailbox checks. */
   async _saveBackgroundConfig() {
     await this.store.put('kv', 'bg', {
-      fp: this.identity.fp,
+      mailTopics: await this.myMailTopics(),
       mailboxRelays: this.settings.mailboxRelays || [],
       notifications: !!this.settings.notifications,
       mailSince: this.mailSince,
@@ -215,8 +254,9 @@ export class Engine extends EventTarget {
 
   /** Invalidate every contact link shared so far; old links fall back to contact requests. */
   async resetInvite() {
-    this.invite = newInvite();
+    this.invite = newInvite(this.invite);
     await this.store.put('kv', 'invite', this.invite);
+    await this._saveBackgroundConfig();
     this._emit('change', { what: 'invite' });
   }
 
@@ -1159,8 +1199,10 @@ export class Engine extends EventTarget {
     if (!sum || typeof sum !== 'object') return;
     if (typeof sum.name === 'string' && Number(sum.nameAt) > this.nameAt) await this.setName(sum.name, Number(sum.nameAt));
     if (sum.invite && INVITE_RE.test(sum.invite.token) && Number(sum.invite.at) > (this.invite?.at || 0)) {
-      this.invite = { token: sum.invite.token, at: Number(sum.invite.at) };
+      const old = (Array.isArray(sum.invite.old) ? sum.invite.old : []).filter((t) => INVITE_RE.test(t)).slice(0, MAX_OLD_INVITES);
+      this.invite = { token: sum.invite.token, at: Number(sum.invite.at), old };
       await this.store.put('kv', 'invite', this.invite);
+      this._emit('change', { what: 'invite' });
     }
     for (const [fp, at] of Object.entries(sum.removed || {})) {
       const c = this.contacts.get(fp);

@@ -108,3 +108,31 @@ test('backup restore rejects absurd key-stretching parameters', async () => {
   await assert.rejects(C.decryptBackup({ ...file, iterations: 1 }, 'correct horse battery'), /not a backup file/);
   await assert.rejects(C.decryptBackup({ ...file, iterations: 1e12 }, 'correct horse battery'), /not a backup file/);
 });
+
+test('relay topics: computable only by the two people involved, never from a card alone', async () => {
+  const { liveTopic, mailTopic } = await import('../../public/js/core/topics.js');
+  const a = await user('A'), b = await user('B'), e = await user('Eve');
+  await befriend(a, b);
+  // Eve holds both cards (say, from a group) but shares neither's secret.
+  await e.addContact(a.identity.card()); await e.addContact(b.identity.card());
+  const ab = await a.pairKey(b.identity.fp), ba = await b.pairKey(a.identity.fp);
+  assert.deepEqual(ab, ba, 'both ends derive the same key');
+  assert.equal(await liveTopic(ab, 100), await liveTopic(ba, 100));
+  assert.notEqual(await liveTopic(ab, 100), await liveTopic(ab, 101), 'live topics rotate daily');
+  const eves = [await e.pairKey(a.identity.fp), await e.pairKey(b.identity.fp)];
+  for (const k of eves) assert.notEqual(await liveTopic(k, 100), await liveTopic(ab, 100));
+  // A's own devices meet on a topic only A's key can produce.
+  assert.notDeepEqual(await a.pairKey(a.identity.fp), ab);
+
+  // Mail topics: one per person we listen to plus one per link token; a removed contact's goes away.
+  const before = await a.myMailTopics();
+  assert.equal(before.length, 2);
+  assert.ok(before.includes(await mailTopic(ab)));
+  await a.resetInvite();
+  assert.equal((await a.myMailTopics()).length, 3, 'the retired link token is still listened for');
+  await a.removeContact(b.identity.fp);
+  assert.ok(!(await a.myMailTopics()).includes(await mailTopic(ab)));
+  await a._saveBackgroundConfig();
+  assert.deepEqual((await a.store.get('kv', 'bg')).mailTopics, await a.myMailTopics());
+  assert.equal((await a.store.get('kv', 'bg')).fp, undefined, 'the service worker config no longer names us');
+});

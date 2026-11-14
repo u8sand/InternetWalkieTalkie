@@ -135,6 +135,14 @@ async function aesDecrypt(key, blob, aad) {
   return new Uint8Array(await subtle.decrypt(params, key, blob.subarray(12)));
 }
 
+/**
+ * A key only `id` and the owner of `dhKey` can compute (static ECDH). Used to derive the relay
+ * topics the two meet on; never used to encrypt anything.
+ */
+export async function pairKey(id, dhKey) {
+  return sha256(concat(utf8('iwt-pair-v1|'), await ecdh(id.dhPriv, dhKey)));
+}
+
 // ---------------------------------------------------------------- ops (CRDT updates)
 
 const HEADER_FIELDS = ['v', 'conv', 'author', 'dev', 'seq', 'lamport', 'ts'];

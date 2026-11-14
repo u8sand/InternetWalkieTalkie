@@ -22,6 +22,7 @@ const ASSETS = [
   'js/core/schnorr.js',
   'js/core/signaling.js',
   'js/core/store.js',
+  'js/core/topics.js',
   'js/vendor/qrcode.js',
   'icons/icon.svg',
   'icons/icon-192.png',
@@ -116,12 +117,7 @@ function idb(db, store, mode, fn) {
   });
 }
 
-async function inboxTopic(fp, day) {
-  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode('iwt-inbox-v1|' + fp + '|' + day)));
-  return Array.from(h.slice(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-function fetchRelay(url, filter, ms = 15000) {
+function fetchRelay(url, filters, ms = 15000) {
   return new Promise((resolve) => {
     const events = [];
     let ws;
@@ -129,7 +125,7 @@ function fetchRelay(url, filter, ms = 15000) {
     const done = () => { clearTimeout(t); try { ws.close(); } catch {} resolve(events); };
     const t = setTimeout(done, ms);
     try { ws = new WebSocket(url); } catch { return done(); }
-    ws.onopen = () => ws.send(JSON.stringify(['REQ', sub, filter]));
+    ws.onopen = () => ws.send(JSON.stringify(['REQ', sub, ...filters]));
     ws.onmessage = (m) => {
       let msg;
       try { msg = JSON.parse(m.data); } catch { return; }
@@ -149,12 +145,15 @@ async function checkMailbox() {
   try {
     const bg = await idb(db, 'kv', 'readonly', (s) => s.get('bg'));
     const relays = (bg && bg.mailboxRelays) || [];
-    if (!bg || !bg.fp || !relays.length) return;
-    const today = Math.floor(Date.now() / 86400000);
-    const topics = await Promise.all(Array.from({ length: 10 }, (_, i) => inboxTopic(bg.fp, today - 8 + i)));
+    // The app works out which topics mail for us can arrive on (they derive from secrets the
+    // worker never sees) and leaves the list here.
+    const topics = ((bg && bg.mailTopics) || []).filter((t) => typeof t === 'string').slice(0, 2000);
+    if (!relays.length || !topics.length) return;
     const floor = Math.floor(Date.now() / 1000) - MAIL_TTL_S;
     const since = Math.max(floor, (bg.mailSince || 0) - 3600);
-    const batches = await Promise.all(relays.map((u) => fetchRelay(u, { kinds: [MAIL_KIND], '#t': topics, since })));
+    const filters = [];
+    for (let i = 0; i < topics.length; i += 400) filters.push({ kinds: [MAIL_KIND], '#t': topics.slice(i, i + 400), since });
+    const batches = await Promise.all(relays.map((u) => fetchRelay(u, filters)));
     let fresh = 0;
     let held = (await idb(db, 'inbox', 'readonly', (s) => s.count())) || 0;
     for (const ev of batches.flat()) {

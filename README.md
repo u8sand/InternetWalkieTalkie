@@ -87,6 +87,7 @@ public/
     peer.js             WebRTC DataChannel, mutual authentication, sync protocol
     net.js              presence, connection setup, manual codes, gossip fan-out
     signaling.js        Nostr relay pool used only as a rendezvous
+    topics.js           relay topics derived from pairwise secrets and link tokens
     schnorr.js          BIP-340 signatures so public relays accept our events
 ```
 
@@ -216,7 +217,7 @@ Contacts still see one person: same fingerprint, same signing key.
 
 - **Connections are per device.** Relay signals carry the sender's device id and may target
   one (`toDev`). Each of your online devices connects to each of your contacts' online
-  devices, and your own devices find each other through your own inbox topic.
+  devices, and your own devices find each other on a topic only your own key can derive.
 - **Your own devices sync everything.** Between them, sync covers every conversation. They
   also exchange an address-book summary on each sync:
   - contacts are add-wins against removal timestamps;
@@ -274,7 +275,12 @@ WebRTC needs a way for peers to swap connection offers. By default the app uses 
 
 - Events use an *ephemeral* kind, which relays forward but don't store.
 - Each session signs with a throwaway Schnorr key.
-- Each user listens on a daily inbox topic derived from their fingerprint.
+- Topics are per pair of people (`js/core/topics.js`): each is a hash of the static ECDH secret
+  the two share, changing daily, so only those two can compute it. Your own devices meet on a
+  topic derived from your own key. Nobody can derive a topic from a contact card.
+- Someone who has your contact link but whom you don't know yet reaches you on an *intro topic*
+  derived from the link's invite token. Resetting the link retires it (the last three retired
+  tokens are still listened for, and only produce contact requests).
 - Event content is opaque ciphertext.
 
 The end-to-end test checks that the relay never sees names, fingerprints, SDP or ICE data.
@@ -285,13 +291,14 @@ symmetric NATs.
 
 ## Threat model and limitations
 
-- **Relays and networks** see that *someone* posted an encrypted blob to an inbox topic, plus the
-  timing and IP addresses. Anyone holding your contact card can work out your inbox topic, and by
-  watching it on a relay can tell when you're online. While you're online, one relay session
-  posts to the topics of everyone you know, so a relay can see that set of topics together with
-  your IP address: a pseudonymous picture of your contact list, which anyone holding those
-  people's cards can map back to them. Use relays you trust, or direct connection codes. WebRTC
-  reveals IP addresses to the peers you connect to (contacts, and members of groups you approved).
+- **Relays and networks** see that *someone* posted an encrypted blob to a topic, plus the
+  timing and IP addresses. Topics are derived from secrets shared by two people, so holding your
+  contact card reveals none of them: an outsider can't watch for you or tell who you talk to. A
+  relay still sees which sessions (IP addresses) post and listen on the same topic, so it can
+  tell that two addresses are in touch and how many people an address talks to, though not who
+  they are. Someone holding your current contact link can compute its intro topic. Use relays
+  you trust, or direct connection codes. WebRTC reveals IP addresses to the peers you connect to
+  (contacts, and members of groups you approved).
 - **Keys are stored unencrypted in this browser profile**, readable by any script on the same
   origin. On GitHub Pages every project site of one account shares the origin
   `https://<user>.github.io`, so another site there (or an XSS hole in one) could read them.
@@ -303,8 +310,9 @@ symmetric NATs.
 - **Group membership and retention are fixed at creation.** Changing either isn't supported yet.
 - **Expiry trusts authors' clocks.** An author whose clock runs slow makes their own messages
   expire early. Clocks more than a day fast are rejected.
-- **Mailbox relays** you list can see when encrypted mail arrives for your inbox topic and how
-  big it is. They can't see the sender, the content or your identity. Use relays you control.
+- **Mailbox relays** you list can see when encrypted mail arrives and how big it is, and, since
+  each sender uses their own topic, how many different people write to you. They can't see who
+  those people are, the content or your identity. Use relays you control.
 - **Background checks** happen only in installed Chromium apps, on the browser's schedule.
 - **Your contact link lets anyone who has it add you** without approval. That's the point of
   sharing it, but if it leaks, reset it.

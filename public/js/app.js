@@ -1112,7 +1112,7 @@ function handleHash() {
         h('div', { class: 'row' }, avatar(k.fp, k.name), h('div', {}, h('div', { class: 'strong', text: name }), h('div', { class: 'mono small', text: k.fp }))),
         h('p', { class: 'muted small', text: card.i
           ? `You'll be connected to ${name} straight away. You can chat whenever you're both online${card.m ? ', or leave messages in their mailbox' : ''}.`
-          : `${name} will get a contact request. Once they accept, you can chat whenever you're both online.` }),
+          : `This is a bare contact card with no invite code, so ${name} won't hear from you until they add you too (or you share a group). Ask them for their contact link to connect straight away.` }),
         h('div', { class: 'row end' },
           h('button', { text: 'Not now', onclick: closeDialog }),
           h('button', { class: 'primary', text: `Add ${name}`, onclick: () => addContactFromText(code).catch((e) => toast(e.message)) })));

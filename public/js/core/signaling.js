@@ -14,18 +14,16 @@
 // are never sent a stored event and are never asked for one.
 
 import { randomSecret, publicKey, nostrEvent } from './schnorr.js';
-import { hex, sha256, utf8, b64u, randomBytes } from './encoding.js';
+import { hex, b64u, randomBytes } from './encoding.js';
 
 export const SIGNAL_KIND = 25050; // 20000–29999 = ephemeral (NIP-16): forwarded, never stored
 export const MAIL_KIND = 4050;    // 1000–9999 = regular (stored) — only ever sent to mailbox relays
 export const MAIL_TTL_S = 7 * 86400;
 
-export const utcDay = (t = Date.now()) => Math.floor(t / 86400000);
-
-/** Inbox topic for a fingerprint on a given UTC day (computable by anyone holding the card). */
-export async function inboxTopic(fp, day = utcDay()) {
-  return hex(await sha256(utf8('iwt-inbox-v1|' + fp + '|' + day))).slice(0, 32);
-}
+// Relays may cap how many values one filter holds, so long topic lists are split up.
+const TOPICS_PER_FILTER = 400;
+const chunks = (list) => Array.from({ length: Math.ceil(list.length / TOPICS_PER_FILTER) }, (_, i) => list.slice(i * TOPICS_PER_FILTER, (i + 1) * TOPICS_PER_FILTER));
+const tTags = (topics) => [].concat(topics).map((t) => ['t', t]);
 
 class Relay {
   constructor(pool, url, mailbox) {
@@ -74,9 +72,10 @@ class Relay {
 
   subscribe() {
     if (!this.open || !this.pool.topics.length) return;
-    const filters = [{ kinds: [SIGNAL_KIND], '#t': this.pool.topics, since: Math.floor(Date.now() / 1000) - 60 }];
+    const since = Math.floor(Date.now() / 1000) - 60;
+    const filters = chunks(this.pool.topics).map((t) => ({ kinds: [SIGNAL_KIND], '#t': t, since }));
     // Stored mail is only requested from the user's own mailbox relays.
-    if (this.mailbox) filters.push({ kinds: [MAIL_KIND], '#t': this.pool.mailTopics, since: this.pool.mailSince });
+    if (this.mailbox) for (const t of chunks(this.pool.mailTopics)) filters.push({ kinds: [MAIL_KIND], '#t': t, since: this.pool.mailSince });
     this.ws.send(JSON.stringify(['REQ', this.pool.subId, ...filters]));
   }
 
@@ -131,8 +130,9 @@ export class RelayPool extends EventTarget {
     return false;
   }
 
-  async publish(topic, content) {
-    const ev = await nostrEvent(this.secret, this.pub, SIGNAL_KIND, [['t', topic]], content);
+  /** @param topics one topic or several (the event reaches subscribers of any of them) */
+  async publish(topics, content) {
+    const ev = await nostrEvent(this.secret, this.pub, SIGNAL_KIND, tTags(topics), content);
     this.seen.add(ev.id);
     const msg = JSON.stringify(['EVENT', ev]);
     let sent = 0;
@@ -172,11 +172,11 @@ export class RelayPool extends EventTarget {
  * Store an encrypted mail event on a contact's own mailbox relays. Opens a short-lived
  * connection to each and resolves with the number of relays that acknowledged it (NIP-20 OK).
  */
-export async function postMail(urls, topic, content, timeoutMs = 10000) {
+export async function postMail(urls, topics, content, timeoutMs = 10000) {
   const secret = randomSecret();
   const pub = hex(publicKey(secret));
   const expires = Math.floor(Date.now() / 1000) + MAIL_TTL_S;
-  const ev = await nostrEvent(secret, pub, MAIL_KIND, [['t', topic], ['expiration', String(expires)]], content);
+  const ev = await nostrEvent(secret, pub, MAIL_KIND, [...tTags(topics), ['expiration', String(expires)]], content);
   const one = (url) => new Promise((resolve) => {
     let ws, done = false;
     const finish = (ok) => { if (done) return; done = true; clearTimeout(t); try { ws?.close(); } catch {} resolve(ok); };
