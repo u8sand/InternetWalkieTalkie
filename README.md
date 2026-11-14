@@ -42,8 +42,8 @@ Progressive Web App on GitHub Pages.
      **Delete chat** (tap the chat title) clears a whole conversation, e.g. with a contact you
      removed. The chat leaves your list until someone writes in it again.
    - **Search** (above the chat list) looks through every conversation on this device.
-   - **Photos and files** (📎, paste, or drag and drop; up to 25 MB): photos are scaled to at most
-     2048 px and re-encoded, which also strips EXIF data such as location. GIFs are sent as is.
+   - **Photos and files** (📎, paste, or drag and drop; up to 25 MB) are sent exactly as they are,
+     metadata included: a photo's EXIF data (which may include where it was taken) goes with it.
      The message arrives like any other (by mailbox too, with a small blurred preview). The file
      itself downloads directly from whoever is connected and has it: the sender, any group member,
      or your own other device.

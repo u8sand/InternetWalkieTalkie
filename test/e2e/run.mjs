@@ -6,6 +6,7 @@
 //   node test/e2e/run.mjs            (SHOTS=dir to save screenshots)
 
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { serve } from '../serve.mjs';
 import { startRelay } from '../relay.mjs';
@@ -159,7 +160,7 @@ try {
   await bob.page.waitForSelector('.msg:has-text("Bob will delete this one")', { state: 'detached' });
   assert.ok(await alice.page.isVisible('.msg:has-text("Bob will delete this one")'), "Alice's copy stays");
 
-  step('photos are resized and re-encoded; files arrive intact in chunks, with a caption');
+  step('photos arrive untouched; files arrive intact in chunks, with a caption');
   const png = Buffer.from(await alice.page.evaluate(async () => {
     const c = document.createElement('canvas'); c.width = 3000; c.height = 1500;
     const x = c.getContext('2d'); x.fillStyle = '#c33'; x.fillRect(0, 0, 3000, 1500); x.fillStyle = '#33c'; x.fillRect(0, 0, 1500, 1500);
@@ -167,14 +168,14 @@ try {
   }));
   await attach(alice, { name: 'holiday.png', mimeType: 'image/png', buffer: png });
   const img = await bob.page.waitForSelector('.msg .att img.att-img[src^="blob:"]', { timeout: 20000 });
-  assert.equal(await img.evaluate((i) => i.naturalWidth), 2048, 'scaled to 2048 px');
-  assert.match(await img.evaluate((i) => i.alt), /^holiday\.(webp|jpg)$/);
+  assert.equal(await img.evaluate((i) => i.naturalWidth), 3000, 'full size');
+  assert.equal(await img.evaluate((i) => i.alt), 'holiday.png');
+  assert.equal(await sha(bob, await fileId(bob, 'holiday.png')), createHash('sha256').update(png).digest('hex'), 'the original bytes');
   const notes = randomBytes(300 * 1024); // 5 chunks
   await alice.page.fill('#composerInput', 'here are the notes');
   await attach(alice, { name: 'notes.bin', mimeType: 'application/octet-stream', buffer: notes });
   await bob.page.waitForSelector('.msg:has-text("here are the notes") .att-file:has-text("notes.bin") .att-save', { timeout: 30000 });
   const notesId = await fileId(bob, 'notes.bin');
-  const { createHash } = await import('node:crypto');
   assert.equal(await sha(bob, notesId), createHash('sha256').update(notes).digest('hex'), 'byte-for-byte');
   assert.equal(await alice.page.inputValue('#composerInput'), '', 'caption sent with the file');
   await shot(bob, '2b-files');

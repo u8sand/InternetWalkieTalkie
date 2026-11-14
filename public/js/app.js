@@ -155,7 +155,6 @@ function parseCardInput(text) {
 
 // ------------------------------------------------------------------ attachments
 
-const PHOTO_MAX_PX = 2048;
 const THUMB_PX = 48;
 
 function fmtSize(n) {
@@ -164,43 +163,24 @@ function fmtSize(n) {
   return (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + ' MB';
 }
 
-function canvasBlob(canvas, type, quality) {
-  return new Promise((r) => canvas.toBlob(r, type, quality));
-}
-
 /**
- * Photos are scaled down and re-encoded (WebP where the browser can, else JPEG). That keeps
- * them small for everyone storing them, and drops EXIF metadata such as GPS location.
- * GIFs are sent as they are, so they keep moving. Anything that won't decode is sent as a file.
+ * Files are sent exactly as they are. For photos we only read the size and make a tiny
+ * blurred preview to show while the original downloads.
  */
 async function prepareFile(file) {
-  let mime = file.type || 'application/octet-stream';
-  if (/^image\/(jpeg|png|webp|avif|bmp|heic|heif)$/.test(mime) || mime === 'image/gif') {
-    try {
-      const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
-      const draw = (max, bg) => {
-        const s = Math.min(1, max / Math.max(bmp.width, bmp.height));
-        const c = h('canvas', { width: Math.max(1, Math.round(bmp.width * s)), height: Math.max(1, Math.round(bmp.height * s)) });
-        const ctx = c.getContext('2d');
-        if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, c.width, c.height); }
-        ctx.drawImage(bmp, 0, 0, c.width, c.height);
-        return c;
-      };
-      const tc = draw(THUMB_PX, '#888');
-      let thumb = tc.toDataURL('image/webp', 0.5);
-      if (!thumb.startsWith('data:image/webp')) thumb = tc.toDataURL('image/jpeg', 0.5);
-      const meta = { thumb, w: bmp.width, h: bmp.height };
-      if (mime === 'image/gif') return { ...meta, bytes: new Uint8Array(await file.arrayBuffer()), name: file.name, mime };
-      let out = await canvasBlob(draw(PHOTO_MAX_PX), 'image/webp', 0.85);
-      if (out?.type !== 'image/webp') out = await canvasBlob(draw(PHOTO_MAX_PX, '#fff'), 'image/jpeg', 0.87);
-      const ext = out.type === 'image/webp' ? '.webp' : '.jpg';
-      const base = (file.name || 'photo').replace(/\.[^.]*$/, '') || 'photo';
-      const s = Math.min(1, PHOTO_MAX_PX / Math.max(bmp.width, bmp.height));
-      return { ...meta, w: Math.round(bmp.width * s), h: Math.round(bmp.height * s), bytes: new Uint8Array(await out.arrayBuffer()), name: base + ext, mime: out.type };
-    } catch { /* not decodable here: send the original as a file */ }
-  }
-  if (mime.startsWith('image/') && !inlineKind(mime)) mime = 'application/octet-stream'; // e.g. SVG: download only
-  return { bytes: new Uint8Array(await file.arrayBuffer()), name: file.name || 'file', mime };
+  const out = { bytes: new Uint8Array(await file.arrayBuffer()), name: file.name || 'file', mime: file.type || 'application/octet-stream' };
+  if (inlineKind(out.mime) !== 'image') return out;
+  try {
+    const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const s = Math.min(1, THUMB_PX / Math.max(bmp.width, bmp.height));
+    const c = h('canvas', { width: Math.max(1, Math.round(bmp.width * s)), height: Math.max(1, Math.round(bmp.height * s)) });
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#888'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(bmp, 0, 0, c.width, c.height);
+    let thumb = c.toDataURL('image/webp', 0.5);
+    if (!thumb.startsWith('data:image/webp')) thumb = c.toDataURL('image/jpeg', 0.5);
+    return { ...out, thumb, w: bmp.width, h: bmp.height };
+  } catch { return out; } // can't decode it here: still sent, just without a preview
 }
 
 async function sendFiles(files) {
@@ -209,10 +189,9 @@ async function sendFiles(files) {
   const input = $('composerInput');
   let caption = input.value.trim() ? input.value : '';
   for (const f of files) {
-    if (f.size > MAX_FILE_BYTES * 4) { toast(`${f.name} is too large (max ${fmtSize(MAX_FILE_BYTES)})`); continue; }
+    if (f.size > MAX_FILE_BYTES) { toast(`${f.name} is too large (max ${fmtSize(MAX_FILE_BYTES)})`); continue; }
     try {
       const p = await prepareFile(f);
-      if (p.bytes.length > MAX_FILE_BYTES) { toast(`${f.name} is too large (max ${fmtSize(MAX_FILE_BYTES)})`); continue; }
       renderChat.forceScroll = true;
       await engine.sendFile(convId, { ...p, caption });
       if (caption) { caption = ''; input.value = ''; input.dispatchEvent(new Event('input')); }
