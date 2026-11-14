@@ -1,6 +1,16 @@
 # Internet Walkie-Talkie
 
-A fully decentralized, end-to-end encrypted messenger that runs as a static
+Private messages that go straight from your device to theirs.
+
+- **Like a walkie-talkie:** messages travel directly to the other person, in real time, while
+  they have the app open. There's no company server in the middle. If they aren't listening,
+  your message waits on your device and is sent as soon as you're both online.
+- **Unlike a walkie-talkie, it's private:** everything is end-to-end encrypted, so only the
+  people in a chat can read it.
+- **Your data stays with you:** messages are stored on your device and the devices of the people
+  you talk to, and nowhere else. No account, phone number or email.
+
+Under the hood it's a fully decentralized, end-to-end encrypted messenger that runs as a static
 Progressive Web App on GitHub Pages.
 
 - **No servers, no accounts.** Your identity is a key pair generated on your device.
