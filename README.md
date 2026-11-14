@@ -320,9 +320,17 @@ symmetric NATs.
   it first gets your identity. The reverse matters too: opening a link code someone *else* made
   would turn a fresh device into a copy of their identity, so the app warns and never links
   without confirmation.
-- **Limits against flooding**: at most 50 pending contact requests, 32 devices per member per
-  conversation, 500 mailbox events held by a background check; large files wait for a tap. A
-  contact can still send many ordinary messages. Within one browser, a Web Lock lets only one tab run.
+- **Limits against flooding**:
+  - Updates from one peer are accepted at 1,000 in a burst, then 20 a second. The rest isn't
+    refused, only left for the next sync, so a long catch-up just takes a few minutes longer.
+  - One member may have at most 20,000 messages or 50 MB stored in one conversation at a time
+    (expired messages free it up). Past that their newer messages are held back and the chat
+    shows a notice: remove them / leave the group, or **Keep receiving**. Until you choose,
+    other members may see messages you don't.
+  - Mailbox mail is processed 200 events at a time; oversized events are skipped, and mail from
+    a sender over the rate limit is kept and finished later.
+  - At most 5 people a minute are auto-accepted from your contact link, 50 contact requests are
+    kept, a member can write from 32 devices per conversation, and files over 5 MB wait for a tap.
 - **Device revocation isn't supported.** A lost device keeps the identity. The remedy is a new
   identity; key rotation is future work.
 - **Equivocation.** A malicious member could sign two different ops with the same sequence number.

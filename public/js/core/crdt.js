@@ -46,9 +46,13 @@ export const streamOf = (env) => env.author + '/' + env.dev;
 /** Message id; starts with the author fingerprint so authorship checks stay simple. */
 export const msgId = (env) => env.author + ':' + env.dev + ':' + env.seq;
 
+/** Rough stored size of an op (a stub holds no content). Cheap: no re-serialising. */
+const sizeOf = (env) => (env.stub ? 0 : 300 + (env.ct?.length || 0) + 130 * Object.keys(env.keys || {}).length);
+
 /** Per-conversation set of encrypted ops with version-vector bookkeeping. */
 export class OpLog {
   constructor() {
+    this.usage = new Map();    // author -> {ops, bytes} held from them (what a storage budget is checked against)
     this.byAuthor = new Map(); // stream -> Map<seq, env> (live ops, pinned ops, watermark)
     this.contig = new Map();   // stream -> highest contiguous seq (counting from the floor)
     this.floors = new Map();   // stream -> seq of the newest expired op (everything ≤ it is gone or pinned)
@@ -74,6 +78,16 @@ export class OpLog {
     return this.byAuthor.get(stream)?.get(seq);
   }
 
+  _use(env, ops, bytes) {
+    let u = this.usage.get(env.author);
+    if (!u) { u = { ops: 0, bytes: 0 }; this.usage.set(env.author, u); }
+    u.ops += ops; u.bytes += bytes;
+  }
+
+  usageOf(author) {
+    return this.usage.get(author) || { ops: 0, bytes: 0 };
+  }
+
   /** Returns true if the op was new. */
   add(env, pinned = false) {
     const st = streamOf(env);
@@ -81,6 +95,7 @@ export class OpLog {
     if (!m) { m = new Map(); this.byAuthor.set(st, m); }
     if (m.has(env.seq)) return false;
     m.set(env.seq, env);
+    this._use(env, 1, sizeOf(env));
     if (pinned) this.pinned.add(msgId(env));
     this._recount(st);
     return true;
@@ -97,7 +112,7 @@ export class OpLog {
     const m = this.byAuthor.get(st);
     const dropped = [];
     for (const [s, env] of m) {
-      if (s < seq && !this.pinned.has(msgId(env))) { m.delete(s); dropped.push(env); }
+      if (s < seq && !this.pinned.has(msgId(env))) { m.delete(s); dropped.push(env); this._use(env, -1, -sizeOf(env)); }
     }
     this.floors.set(st, seq);
     this._recount(st);
@@ -144,7 +159,9 @@ export class OpLog {
   /** Swap a held op for its header-only stub (same stream and seq, so the version vector is unchanged). */
   replace(stub) {
     const m = this.byAuthor.get(streamOf(stub));
-    if (m?.has(stub.seq)) m.set(stub.seq, stub);
+    if (!m?.has(stub.seq)) return;
+    this._use(stub, 0, sizeOf(stub) - sizeOf(m.get(stub.seq)));
+    m.set(stub.seq, stub);
   }
 
   get size() {

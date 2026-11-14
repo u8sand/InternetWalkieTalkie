@@ -20,6 +20,13 @@ const MAIL_RETRY_MS = 60000;
 const MAIL_BATCH_BYTES = 32 * 1024;
 const RCPT_DELAY_MS = 400;     // coalesce receipts for a burst of incoming ops
 const RCPT_MAIL_EVERY_MS = 60000;
+// Mailbox flood limits: anyone we listen to can post mail, so bound what one pass handles.
+const MAX_MAIL_CHARS = 512 * 1024;  // larger than any mail the app sends (same cap as the service worker)
+const MAX_MAIL_QUEUE = 2000;        // events waiting in memory
+const MAIL_PASS = 200;              // events handled before pausing…
+const MAIL_PAUSE_MS = 1000;         // …this long, so the app stays responsive
+const MAX_HELD_MAIL = 500;          // events kept on disk for a later pass (rate-limited senders)
+const INVITES_PER_MIN = 5;          // people auto-accepted from our link per minute
 
 export class Network extends EventTarget {
   constructor(engine) {
@@ -35,6 +42,8 @@ export class Network extends EventTarget {
     this.rcptLive = new Set();    // convs whose receipt should go to connected members soon
     this.rcptMail = new Map();    // fp -> Set<conv>: receipts to mail to members who are offline
     this.lastRcptMail = new Map();
+    this.mailQueue = [];          // inbound mail events not processed yet
+    this.inviteTimes = [];        // when we last auto-accepted people from our link
     this.files = new FileFetcher(this, engine);
     this.pool = new RelayPool();
     this.pool.addEventListener('event', (e) => this._onRelayEvent(e.detail));
@@ -74,6 +83,7 @@ export class Network extends EventTarget {
     this._refreshTopics();
     this.timer = setInterval(() => {
       this._refreshTopics(); this._presence(); this._flushAllMail(); this._flushReceiptMail();
+      if (this._heldMail) this.processInbox();
       for (const p of this.peers.values()) if (!p.ownDevice) this.engine.noteSeen(p.fp).catch(() => {});
     }, HELLO_EVERY_MS / 2);
     globalThis.addEventListener?.('online', () => { this._presence(true); this._flushAllMail(true); });
@@ -82,11 +92,53 @@ export class Network extends EventTarget {
 
   /** Mail the service worker fetched in the background while the app was closed. */
   async processInbox() {
+    if (this._inboxBusy) return;
+    this._inboxBusy = true;
+    try {
+      const store = this.engine.store;
+      let held = false, n = 0;
+      for (const ev of (await store.all('inbox')) || []) {
+        if ((await this._onMail(ev)) === 'defer') { held = true; continue; } // sender over the rate: next pass
+        await store.del('inbox', ev.id);
+        if (++n % MAIL_PASS === 0) await new Promise((r) => setTimeout(r, MAIL_PAUSE_MS));
+      }
+      this._heldMail = held;
+    } finally { this._inboxBusy = false; }
+  }
+
+  /** Mail arriving from a mailbox relay: queued, and worked through a bounded batch at a time. */
+  _inboundMail(ev) {
+    if (typeof ev.content !== 'string' || ev.content.length > MAX_MAIL_CHARS) return;
+    // Too much waiting: drop it, and stop advancing the "seen up to" mark so it's fetched again next time.
+    if (this.mailQueue.length >= MAX_MAIL_QUEUE) { this.mailOverflow = true; return; }
+    this.mailQueue.push(ev);
+    this._drainMail();
+  }
+
+  async _drainMail() {
+    if (this._draining) return;
+    this._draining = true;
+    try {
+      for (let n = 1; this.mailQueue.length; n++) {
+        const ev = this.mailQueue.shift();
+        if ((await this._onMail(ev)) === 'defer') await this._holdMail(ev);
+        if (n % MAIL_PASS === 0) await new Promise((r) => setTimeout(r, MAIL_PAUSE_MS));
+        else if (n % 20 === 0) await new Promise((r) => setTimeout(r, 0));
+      }
+    } catch (e) { console.warn('mail processing failed', e); }
+    finally { this._draining = false; }
+  }
+
+  /** Keep a mail event whose sender is over the rate limit, to finish it on a later pass. */
+  async _holdMail(ev) {
     const store = this.engine.store;
-    for (const ev of (await store.all('inbox')) || []) {
-      await this._onMail(ev);
-      await store.del('inbox', ev.id);
-    }
+    if (((await store.keys('inbox')) || []).length >= MAX_HELD_MAIL) { this.mailOverflow = true; return; }
+    await store.put('inbox', ev.id, { id: ev.id, kind: ev.kind, content: ev.content, created_at: ev.created_at });
+    this._heldMail = true;
+  }
+
+  async _seenMail(ev) {
+    if (!this.mailOverflow && Number.isSafeInteger(ev.created_at)) await this.engine.setMailSince(ev.created_at);
   }
 
   /** Ready connections to any device of fp. */
@@ -195,6 +247,11 @@ export class Network extends EventTarget {
     if (!this.engine.checkInvite(payload.inv)) return false;
     // The token is reusable, so it must not let back in someone the user removed.
     if (this.engine.isBlocked(sender.fp)) return false;
+    // A leaked link can't be used to mass-add contacts: beyond this rate, people wait.
+    const now = Date.now();
+    this.inviteTimes = this.inviteTimes.filter((t) => now - t < 60000);
+    if (this.inviteTimes.length >= INVITES_PER_MIN) return false;
+    this.inviteTimes.push(now);
     await this.engine.addContact(sender.card, { via: 'invite' });
     if (Array.isArray(payload.mb)) await this.engine.setPeerMailboxes(sender.fp, payload.mb);
     this._emit('invited', { fp: sender.fp });
@@ -220,7 +277,7 @@ export class Network extends EventTarget {
   }
 
   async _onRelayEvent(ev) {
-    if (ev.kind === MAIL_KIND) return this._onMail(ev);
+    if (ev.kind === MAIL_KIND) return this._inboundMail(ev);
     let payload, sender;
     try { ({ payload, sender } = await openSignal(this.engine.identity, ev.content)); } catch { return; }
     if (Math.abs(Date.now() - payload.ts) > MAX_SKEW_MS) return;
@@ -356,21 +413,25 @@ export class Network extends EventTarget {
       for (const [id, r] of Object.entries(payload.convs).slice(0, 256)) {
         if (r && typeof r === 'object') await this.engine.noteReceipt(id, sender.fp, { got: r.got, read: r.read });
       }
-      if (Number.isSafeInteger(ev.created_at)) await this.engine.setMailSince(ev.created_at);
+      await this._seenMail(ev);
       return;
     }
     if (payload.type !== 'mail' || !Array.isArray(payload.ops)) return;
     if (Date.now() - payload.ts > (MAIL_TTL_S + 86400) * 1000) return;
     // Strangers can't mail us, unless they present our link's invite token.
     if (!this.engine.knownPeers().has(sender.fp) && !(await this._acceptInvite(sender, payload))) return;
-    let added = 0;
+    let added = 0, limited = false;
     for (const env of payload.ops.slice(0, 500)) {
       if (env?.author !== sender.fp) continue; // only authors mail their own ops
-      if ((await this.engine.ingest(env, sender.fp)).added) added++;
+      const r = await this.engine.ingest(env, sender.fp);
+      if (r.added) added++;
+      else if (r.reason === 'rate limited') { limited = true; break; }
     }
     debug('mail from', sender.fp.slice(0, 8), 'added', added);
-    if (Number.isSafeInteger(ev.created_at)) await this.engine.setMailSince(ev.created_at);
+    await this._seenMail(ev);
     if (added) this._emit('synced', { fp: sender.fp, added, via: 'mailbox' });
+    // Mail isn't resent like live sync is, so keep the event and finish it on a later pass.
+    if (limited) return 'defer';
   }
 
   async _offer(fp, dev) {
@@ -530,6 +591,11 @@ export class Network extends EventTarget {
       return null;
     }
     throw new Error('Not a connection code');
+  }
+
+  /** Ask every connected peer for what we're missing now (instead of waiting for the periodic sync). */
+  resync() {
+    for (const p of this.peers.values()) p.sendSync();
   }
 
   cancelPending(sid) {

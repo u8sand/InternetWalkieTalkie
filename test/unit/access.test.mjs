@@ -136,3 +136,65 @@ test('relay topics: computable only by the two people involved, never from a car
   assert.deepEqual((await a.store.get('kv', 'bg')).mailTopics, await a.myMailTopics());
   assert.equal((await a.store.get('kv', 'bg')).fp, undefined, 'the service worker config no longer names us');
 });
+
+test('rate limit: a burst over the limit is deferred, not lost, and our own devices are exempt', async () => {
+  const a = await user('A'), b = await user('B');
+  await befriend(a, b);
+  a.limits.burst = 5; a.limits.perSecond = 1;
+  let now = Date.now(); a.now = () => now;
+  const conv = (await b.directConv(a.identity.fp)).id;
+  const envs = [];
+  for (let i = 0; i < 8; i++) envs.push(await b.sendText(conv, 'm' + i));
+  const first = [];
+  for (const e of envs) first.push(await a.ingest(structuredClone(e), b.identity.fp + '/' + b.device));
+  assert.equal(first.filter((r) => r.added).length, 5);
+  assert.equal(first[5].reason, 'rate limited');
+  assert.deepEqual(a.vv(conv), { [b.identity.fp + '/' + b.device]: 5 }, 'the version vector still asks for the rest');
+  // The next sync, a little later, delivers what was deferred.
+  now += 3000;
+  for (const e of b.missingFor(conv, a.vv(conv))) await a.ingest(structuredClone(e), b.identity.fp + '/' + b.device);
+  assert.equal(texts(a, conv).length, 8);
+  // Our own other device may send a whole history at once.
+  now += 1; a._buckets.clear(); a.limits.burst = 1;
+  const own = a.identity.fp + '/00000000000000aa';
+  for (let i = 0; i < 4; i++) assert.equal((await a.ingest(await b.sendText(conv, 'o' + i), own)).added, true);
+});
+
+test('storage budget: a member over it is held back until the user allows more', async () => {
+  const a = await user('A'), b = await user('B');
+  await befriend(a, b);
+  a.limits.memberOps = 3;
+  const conv = (await b.directConv(a.identity.fp)).id;
+  const events = [];
+  a.addEventListener('change', (e) => { if (e.detail.what === 'budget') events.push(e.detail.fp); });
+  const res = [];
+  for (let i = 0; i < 6; i++) res.push(await a.ingest(await b.sendText(conv, 'm' + i), 'x'));
+  assert.deepEqual(res.map((r) => r.added), [true, true, true, false, false, false]);
+  assert.equal(res[3].reason, 'over budget');
+  assert.deepEqual(a.heldBack(conv), [b.identity.fp]);
+  assert.deepEqual(events, [b.identity.fp], 'the user is told once');
+  // Our own messages are never held back.
+  await a.sendText(conv, 'mine 1'); await a.sendText(conv, 'mine 2'); await a.sendText(conv, 'mine 3');
+  assert.equal((await a.sendText(conv, 'mine 4')).seq, 4);
+  // "Keep receiving" doubles the allowance; sync then brings the held messages.
+  await a.allowMore(conv, b.identity.fp);
+  assert.deepEqual(a.heldBack(conv), []);
+  for (const e of b.missingFor(conv, a.vv(conv))) await a.ingest(structuredClone(e), 'x');
+  assert.equal(texts(a, conv).filter((t) => t.startsWith('m') && !t.startsWith('mine')).length, 6);
+  assert.equal(a.logs.get(conv).usageOf(b.identity.fp).ops, 6);
+});
+
+test('storage budget counts only what is still held: expired messages free it', async () => {
+  const a = await user('A'), b = await user('B');
+  await befriend(a, b);
+  const conv = (await b.directConv(a.identity.fp)).id;
+  let now = Date.now(); a.now = () => now; b.now = () => now;
+  for (let i = 0; i < 4; i++) await a.ingest(await b.sendText(conv, 'old' + i), 'x');
+  const before = { ...a.logs.get(conv).usageOf(b.identity.fp) };
+  assert.equal(before.ops, 4); assert.ok(before.bytes > 0);
+  now += 366 * 86400000;
+  await a.prune();
+  const after = a.logs.get(conv).usageOf(b.identity.fp);
+  assert.equal(after.ops, 1, 'only the watermark remains');
+  assert.ok(after.bytes < before.bytes);
+});

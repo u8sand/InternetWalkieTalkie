@@ -47,6 +47,14 @@ const MAX_REQUESTS = 50;            // pending contact requests kept; further on
 const MAX_STREAMS_PER_AUTHOR = 32;  // devices one member may write from in one conversation
 // Attachments larger than this from other people are fetched only once the user asks.
 export const AUTO_FETCH_BYTES = 5 * 1024 * 1024;
+// Flood limits (per engine, so tests can lower them).
+export const DEFAULT_LIMITS = {
+  // Ops accepted from one peer: a burst, then a steady rate. The excess is not refused for
+  // good, only left for a later sync, so history still converges.
+  burst: 1000, perSecond: 20,
+  // What one member may have stored in one conversation at a time (expired messages free it).
+  memberOps: 20000, memberBytes: 50 * 1024 * 1024,
+};
 
 /** Header-only copy of an op: keeps its place in the version vector, holds no content. */
 const stubOf = (env) => ({ v: env.v, conv: env.conv, author: env.author, dev: env.dev, seq: env.seq, lamport: env.lamport, ts: env.ts, stub: true });
@@ -120,6 +128,9 @@ export class Engine extends EventTarget {
     this._pairKeys = new Map(); // fp -> key shared with them (relay topics derive from it)
     this.relayRcpt = new Map(); // group conv -> {fp -> signed receipt}: passed on to members who can't reach fp
     this.now = () => Date.now(); // overridable clock (tests)
+    this.limits = { ...DEFAULT_LIMITS };
+    this._buckets = new Map();  // peer fp -> {tokens, at}: ingest rate limit
+    this.held = new Map();      // conv -> Set<fp>: members over their storage budget, whose new ops we hold back
     this._queue = Promise.resolve();
   }
 
@@ -985,6 +996,44 @@ export class Engine extends EventTarget {
     return true;
   }
 
+  // ------------------------------------------------------------ flood limits
+
+  /** Take one token from a peer's bucket. False = over the rate; try again on a later sync. */
+  _allowRate(peer) {
+    const now = this.now();
+    const { burst, perSecond } = this.limits;
+    let b = this._buckets.get(peer);
+    if (!b) { b = { tokens: burst, at: now }; this._buckets.set(peer, b); }
+    b.tokens = Math.min(burst, b.tokens + Math.max(0, now - b.at) / 1000 * perSecond);
+    b.at = now;
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
+  }
+
+  /** Is this member at their storage budget for the conversation (scaled by what the user allowed)? */
+  _overBudget(conv, author) {
+    if (author === this.identity.fp) return false;
+    const u = this.logs.get(conv.id).usageOf(author);
+    const scale = 1 + (conv.allow?.[author] || 0);
+    return u.ops >= this.limits.memberOps * scale || u.bytes >= this.limits.memberBytes * scale;
+  }
+
+  /** Members whose new messages are being held back in a conversation (shown to the user). */
+  heldBack(convId) {
+    return [...(this.held.get(convId) || [])];
+  }
+
+  /** The user chose to keep receiving from this member: raise their budget by one more allowance. */
+  async allowMore(convId, fp) {
+    const conv = this.convs.get(convId);
+    if (!conv) return;
+    conv.allow = { ...(conv.allow || {}), [fp]: (conv.allow?.[fp] || 0) + 1 };
+    await this.store.put('convs', convId, conv);
+    this.held.get(convId)?.delete(fp);
+    this._emit('change', { what: 'budget', conv: convId });
+  }
+
   // ------------------------------------------------------------ sync surface
 
   /** Conversations a given peer is a member of (the only ones we ever tell them about). */
@@ -1020,6 +1069,15 @@ export class Engine extends EventTarget {
     if (conv && this.logs.get(env.conv).has(streamOf(env), env.seq)) return { added: false, reason: 'duplicate' };
     if (typeof env.keys[me] !== 'string') return { added: false, reason: 'not addressed to us' };
     if (env.ts > this.now() + MAX_FUTURE_MS) return { added: false, reason: 'timestamp in the future' };
+    // Flood limits, checked before any crypto so refusing is cheap. Both leave the op with
+    // the sender; a later sync offers it again.
+    if (conv && this._overBudget(conv, env.author)) {
+      let set = this.held.get(conv.id);
+      if (!set) { set = new Set(); this.held.set(conv.id, set); }
+      if (!set.has(env.author)) { set.add(env.author); this._emit('change', { what: 'budget', conv: conv.id, fp: env.author }); }
+      return { added: false, reason: 'over budget' };
+    }
+    if (typeof source === 'string' && !fromOwn && !this._allowRate(source.split('/')[0])) return { added: false, reason: 'rate limited' };
 
     let body;
     try { body = await openOp(this.identity, env); } catch { return { added: false, reason: 'decrypt failed' }; }

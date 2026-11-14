@@ -920,6 +920,25 @@ function renderChat() {
         } }),
         h('button', { class: 'primary', text: 'Connect to all members', onclick: async () => { await engine.trustGroup(convId); render(); } }))));
   }
+  for (const fp of engine.heldBack(currentConv)) {
+    const convId = currentConv;
+    const who = engine.displayName(fp);
+    items.push(h('div', { class: 'notice' },
+      h('p', { text: `${who} has sent an unusually large amount in this chat, so their newer messages are being held back to protect this device's storage. Other members may see messages you don't until you choose.` }),
+      h('div', { class: 'row end' },
+        conv.kind === 'group'
+          ? h('button', { class: 'danger', text: 'Leave group', onclick: async () => {
+            if (!confirm('Leave this group? Its messages are deleted from your devices and you will receive no more of them.')) return;
+            await engine.declineGroup(convId);
+            if (currentConv === convId) currentConv = null;
+            render();
+          } })
+          : h('button', { class: 'danger', text: 'Remove contact', onclick: async () => {
+            if (!confirm(`Remove ${who}? They will no longer be able to connect to you or message you unless you add them again.`)) return;
+            await engine.removeContact(fp); engine.held.get(convId)?.delete(fp); render();
+          } }),
+        h('button', { text: 'Keep receiving', onclick: async () => { await engine.allowMore(convId, fp); net.resync(); render(); } }))));
+  }
   let lastDay = '', lastAuthor = null;
   for (const m of view.list()) {
     const day = fmtDay(m.ts);
