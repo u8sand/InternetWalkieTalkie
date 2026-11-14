@@ -99,6 +99,7 @@ public/
     peer.js             WebRTC DataChannel, mutual authentication, sync protocol
     net.js              presence, connection setup, manual codes, gossip fan-out
     signaling.js        Nostr relay pool used only as a rendezvous
+    relaysession.js     the sync protocol carried by relay events when no direct connection forms
     topics.js           relay topics derived from pairwise secrets and link tokens
     schnorr.js          BIP-340 signatures so public relays accept our events
 ```
@@ -297,6 +298,25 @@ WebRTC needs a way for peers to swap connection offers. By default the app uses 
 
 The end-to-end test checks that the relay never sees names, fingerprints, SDP or ICE data.
 
+#### When no direct connection can form
+
+Some networks don't let two devices reach each other (strict NATs, firewalls, mobile carriers).
+The app then keeps working in one of two ways, and shows which under the contact's name
+("direct connection", "through a TURN server" or "through a relay"):
+
+- **TURN server** (Settings → STUN/TURN servers, as `turn:host:3478 username password`): carries
+  the WebRTC connection itself, so everything works, including files and device linking.
+- **Relay fallback** (automatic): if a contact is reachable on the relays but no direct
+  connection has formed after a few seconds, the same sync protocol runs over relay events
+  (`js/core/relaysession.js`). Each message is cut into parts of at most 24 KB, sealed like any
+  other signal (encrypted to the recipient, signed by the sender) and paced to respect relay
+  rate limits. Loss and reordering are harmless: it's the same CRDT sync, repaired by the
+  periodic re-sync. Files are not sent this way; they wait for a direct connection. The app
+  keeps retrying a direct connection in the background, backing off if it keeps failing.
+
+Settings → **Connect directly** can be switched off to use relays only, which hides your IP
+address from the people you talk to (relays still see it).
+
 You can change the relays in Settings or remove them all. **Direct connection codes** need no
 infrastructure at all. STUN servers are configurable too; add a TURN server for peers behind
 symmetric NATs.
@@ -308,7 +328,9 @@ symmetric NATs.
   contact card reveals none of them: an outsider can't watch for you or tell who you talk to. A
   relay still sees which sessions (IP addresses) post and listen on the same topic, so it can
   tell that two addresses are in touch and how many people an address talks to, though not who
-  they are. Someone holding your current contact link can compute its intro topic. Use relays
+  they are. When no direct connection can form, the relays also carry the (encrypted) messages
+  themselves, so they see how much two addresses exchange and when; never what.
+  Someone holding your current contact link can compute its intro topic. Use relays
   you trust, or direct connection codes. WebRTC reveals IP addresses to the peers you connect to
   (contacts, and members of groups you approved).
 - **Keys are stored unencrypted in this browser profile**, readable by any script on the same
@@ -348,6 +370,8 @@ symmetric NATs.
   identity; key rotation is future work.
 - **Equivocation.** A malicious member could sign two different ops with the same sequence number.
   Each replica keeps the first one it sees.
+- **Photos, files and device linking need a direct connection or a TURN server.** The relay
+  fallback carries messages only.
 - **Both peers must be online at the same time**, unless another member passes the updates along
   or the recipient has a mailbox relay.
 - **The app is only as trustworthy as the code you first load.** After that, the cached copy keeps

@@ -6,6 +6,7 @@
 // through our own inbox to keep history and the address book in sync.
 
 import { Peer } from './peer.js';
+import { RelaySession } from './relaysession.js';
 import { RelayPool, postMail, MAIL_KIND, MAIL_TTL_S } from './signaling.js';
 import { utcDay, liveTopic, mailTopic, introTopic, introMailTopic } from './topics.js';
 import { sealSignal, openSignal } from './crypto.js';
@@ -27,6 +28,10 @@ const MAIL_PASS = 200;              // events handled before pausing…
 const MAIL_PAUSE_MS = 1000;         // …this long, so the app stays responsive
 const MAX_HELD_MAIL = 500;          // events kept on disk for a later pass (rate-limited senders)
 const INVITES_PER_MIN = 5;          // people auto-accepted from our link per minute
+// Relay fallback: when an endpoint is reachable on the relays but no direct connection forms.
+const RELAY_GRACE_MS = 5000;        // give WebRTC this long before relaying
+const RELAY_ALIVE_MS = 70000;       // a relayed endpoint is gone after this long without a signal
+const DIRECT_RETRY_MAX_MS = 10 * 60000; // slowest pace for retrying a direct connection that keeps failing
 
 export class Network extends EventTarget {
   constructor(engine) {
@@ -44,6 +49,8 @@ export class Network extends EventTarget {
     this.lastRcptMail = new Map();
     this.mailQueue = [];          // inbound mail events not processed yet
     this.inviteTimes = [];        // when we last auto-accepted people from our link
+    this.sighted = new Map();     // endpoint -> when its signals started arriving (relay fallback timer)
+    this.directFails = new Map(); // endpoint -> {n, at}: failed direct attempts, for back-off
     this.files = new FileFetcher(this, engine);
     this.pool = new RelayPool();
     this.pool.addEventListener('event', (e) => this._onRelayEvent(e.detail));
@@ -68,7 +75,11 @@ export class Network extends EventTarget {
         this._introduce(e.detail.fp);
       }
     });
-    engine.addEventListener('settings', () => { this._setRelays(); this._refreshTopics(); });
+    engine.addEventListener('settings', () => {
+      this._setRelays(); this._refreshTopics();
+      // Direct connections switched off: hang up the ones we have; the relays take over.
+      if (!this.directAllowed()) for (const p of [...this.peers.values(), ...this.pending.values()]) if (p.direct && !p.manual) p.close();
+    });
   }
 
   _emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
@@ -84,6 +95,8 @@ export class Network extends EventTarget {
     this.timer = setInterval(() => {
       this._refreshTopics(); this._presence(); this._flushAllMail(); this._flushReceiptMail();
       if (this._heldMail) this.processInbox();
+      // A relayed endpoint that has gone quiet is offline.
+      for (const p of [...this.peers.values()]) if (!p.direct && Date.now() - p.lastSeen > RELAY_ALIVE_MS) p.close();
       for (const p of this.peers.values()) if (!p.ownDevice) this.engine.noteSeen(p.fp).catch(() => {});
     }, HELLO_EVERY_MS / 2);
     globalThis.addEventListener?.('online', () => { this._presence(true); this._flushAllMail(true); });
@@ -149,6 +162,54 @@ export class Network extends EventTarget {
   }
 
   isOnline(fp) { return this.devicesOf(fp).length > 0; }
+
+  /** How traffic reaches fp: 'direct', 'turn' (through a TURN server), 'relay' (through signalling relays) or null. */
+  route(fp) {
+    let best = null;
+    for (const p of this.devicesOf(fp)) {
+      if (p.route === 'direct') return 'direct';
+      if (p.route === 'turn' || !best) best = p.route;
+    }
+    return best;
+  }
+
+  directAllowed() { return this.engine.settings.directConnections !== false; }
+
+  /** May we try a direct connection to this endpoint now? (Backs off after repeated failures.) */
+  _mayTryDirect(ek) {
+    if (!this.directAllowed()) return false;
+    const f = this.directFails.get(ek);
+    return !f || Date.now() - f.at >= Math.min(HELLO_EVERY_MS * 2 ** (f.n - 1), DIRECT_RETRY_MAX_MS);
+  }
+
+  /**
+   * A known endpoint just signalled us, so it's online and reachable through the relays. If
+   * no direct connection has formed a little later, talk to it through the relays instead.
+   */
+  _sighted(fp, dev) {
+    const ek = fp + '/' + dev;
+    const cur = this.peers.get(ek);
+    if (cur) { if (!cur.direct) cur.lastSeen = Date.now(); return; }
+    if (this.sighted.has(ek)) return;
+    this.sighted.set(ek, Date.now());
+    setTimeout(() => { this.sighted.delete(ek); this._openRelay(fp, dev); }, this.directAllowed() ? RELAY_GRACE_MS : 0);
+  }
+
+  /** Start talking to an endpoint through the relays, unless a session with it already exists. */
+  _openRelay(fp, dev) {
+    const ek = fp + '/' + dev;
+    if (this.stopped || this.peers.has(ek)) return this.peers.get(ek);
+    const remote = this.engine.keyring.get(fp);
+    if (!remote || (fp !== this.engine.identity.fp && !this.engine.knownPeers().has(fp))) return null;
+    const s = new RelaySession(this.engine, {
+      remote, dev,
+      sendSignal: (part) => this._signal(fp, { type: 'r', dev: this.engine.device, toDev: dev, ...part }),
+    });
+    this._wire(s);
+    this.peers.set(ek, s); // in place before the first part is handled
+    this._onReady(s);
+    return s;
+  }
 
   /** Number of distinct other people we're connected to (own devices not counted). */
   onlineCount() {
@@ -228,7 +289,8 @@ export class Network extends EventTarget {
     const now = Date.now();
     const me = this.engine.identity.fp;
     for (const fp of [...this.engine.knownPeers(), me]) {
-      if (fp !== me && (this.isOnline(fp) || this._connecting(fp))) continue;
+      // Keep saying hello while only relayed: it shows we're still here, and retries a direct connection.
+      if (fp !== me && (this.route(fp) === 'direct' || this.route(fp) === 'turn' || this._connecting(fp))) continue;
       const last = this.lastHello.get(fp) || 0;
       if (!force && now - last < HELLO_EVERY_MS) continue;
       if (force && now - last < 3000) continue;
@@ -308,19 +370,29 @@ export class Network extends EventTarget {
       if (payload.type === 'hello' && Array.isArray(payload.mb)) this.engine.setPeerMailboxes(fp, payload.mb).catch(() => {});
     }
     const myEk = me + '/' + myDev;
+    this._sighted(fp, dev);
+
+    if (payload.type === 'r') {
+      // A piece of the sync protocol sent through the relay. Ignored while directly connected.
+      // If they've started relaying, they have given up on a direct path for now: join in.
+      const s = this.peers.get(ek) || this._openRelay(fp, dev);
+      if (s && !s.direct) s.receive(payload);
+      return;
+    }
 
     if (payload.type === 'hello') {
-      // Peers only say hello when they are NOT connected to us, so a connection we still
-      // think is open must be stale (e.g. they reloaded): drop it and reconnect.
+      // Peers only say hello when they are NOT directly connected to us, so a direct connection
+      // we still think is open must be stale (e.g. they reloaded): drop it and reconnect.
       const stale = this.peers.get(ek);
-      if (stale && Date.now() - stale.createdAt > 5000) stale.close();
-      else if (stale) return;
+      if (stale?.direct && Date.now() - stale.createdAt > 5000) stale.close();
+      else if (stale?.direct) return;
       // Likewise an attempt that has been pending a while lost its offer/answer.
       for (const p of this.pending.values()) {
         if (p.fp === fp && p.dev === dev && p.state === 'connecting' && Date.now() - p.createdAt > 8000) p.close();
       }
       if (this._connecting(fp, dev)) return;
       if (myEk < ek) {
+        if (!this._mayTryDirect(ek)) return; // our own hellos keep telling them we're here
         debug('offering to', ek.slice(0, 8));
         this._offer(fp, dev);
       } else {
@@ -334,6 +406,7 @@ export class Network extends EventTarget {
       }
     } else if (payload.type === 'offer' && typeof payload.sdp === 'string') {
       if (myEk < ek) return; // we are supposed to be the offerer
+      if (!this.directAllowed()) return;
       for (const p of this.pending.values()) if (p.fp === fp && p.dev === dev) p.close();
       const peer = this._newPeer({ initiator: false, expectedFp: fp, expectedDev: dev, sid: String(payload.sid) });
       try {
@@ -449,24 +522,39 @@ export class Network extends EventTarget {
     const peer = new Peer(this.engine, { timeoutMs: 20000, ...opts, iceServers: this.engine.settings.iceServers });
     this.pending.set(peer.sid, peer);
     this.files.attach(peer);
-    peer.addEventListener('ready', async () => {
-      this.pending.delete(peer.sid);
-      const fp = peer.remote.fp;
-      if (!peer.ownDevice) {
-        if (peer.manual && !this.engine.isContact(fp)) await this.engine.addContact(peer.remote.card);
-        await this.engine.clearInvite(fp); // they know us now
+    peer.addEventListener('ready', () => this._onReady(peer));
+    peer.addEventListener('route', () => this._emit('peers', { fp: peer.fp, online: true, own: peer.ownDevice }));
+    this._wire(peer);
+    return peer;
+  }
+
+  /** A session (direct or relayed) is authenticated and ready to sync. */
+  async _onReady(peer) {
+    if (peer.sid) this.pending.delete(peer.sid);
+    const fp = peer.remote.fp;
+    if (peer.direct) this.directFails.delete(peer.ek);
+    if (!peer.ownDevice) {
+      if (peer.manual && !this.engine.isContact(fp)) await this.engine.addContact(peer.remote.card);
+      await this.engine.clearInvite(fp); // they know us now
+      if (peer.direct) {
         this.engine.updatePeerCard(peer.remote.card).catch(() => {});
         await this.engine.setPeerMailboxes(fp, peer.remoteMailboxes || []);
-        await this.engine.clearMail(fp); // direct sync supersedes anything queued
       }
-      const old = this.peers.get(peer.ek);
-      this.peers.set(peer.ek, peer);
-      if (old && old !== peer) old.close();
-      peer.sendSync();
-      // Catch them up on group receipts (direct chats are covered by the sync itself).
-      peer.sendReceipts(this.engine.sharedConvs(fp).filter((id) => this.engine.convs.get(id).kind === 'group'), { relayed: true }).catch(() => {});
-      this._emit('peers', { fp, online: true, own: peer.ownDevice });
-    });
+      await this.engine.clearMail(fp); // live sync supersedes anything queued
+    }
+    const old = this.peers.get(peer.ek);
+    // A relayed session never displaces a direct one that formed in the meantime.
+    if (old && old !== peer && old.direct && !peer.direct) return peer.close();
+    this.peers.set(peer.ek, peer);
+    if (old && old !== peer) old.close();
+    peer.sendSync();
+    // Catch them up on group receipts (direct chats are covered by the sync itself).
+    peer.sendReceipts(this.engine.sharedConvs(fp).filter((id) => this.engine.convs.get(id).kind === 'group'), { relayed: true }).catch(() => {});
+    this._emit('peers', { fp, online: true, own: peer.ownDevice });
+  }
+
+  /** Events common to direct and relayed sessions. */
+  _wire(peer) {
     peer.addEventListener('synced', (e) => this._emit('synced', { fp: peer.fp, ...e.detail }));
     peer.addEventListener('typing', (e) => this._emit('typing', e.detail));
     // Pass group members' receipts on to members who may not be connected to them.
@@ -477,7 +565,12 @@ export class Network extends EventTarget {
       }
     });
     peer.addEventListener('close', () => {
-      this.pending.delete(peer.sid);
+      if (peer.sid) this.pending.delete(peer.sid);
+      // A direct attempt that never got going: remember it, so we don't retry at full pace forever.
+      if (peer.direct && !peer.authed && !peer.manual && peer.expectedFp) {
+        const f = this.directFails.get(peer.ek) || { n: 0, at: 0 };
+        this.directFails.set(peer.ek, { n: f.n + 1, at: Date.now() });
+      }
       if (peer.remote && this.peers.get(peer.ek) === peer) {
         this.peers.delete(peer.ek);
         if (!peer.ownDevice) this.engine.noteSeen(peer.remote.fp, { flush: true }).catch(() => {});
@@ -486,7 +579,6 @@ export class Network extends EventTarget {
         setTimeout(() => this._presence(true), 1000);
       }
     });
-    return peer;
   }
 
   /**
@@ -603,6 +695,7 @@ export class Network extends EventTarget {
   }
 
   stop() {
+    this.stopped = true;
     clearInterval(this.timer);
     this.files.stop();
     this.pool.close();

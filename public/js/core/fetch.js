@@ -58,7 +58,7 @@ export class FileFetcher extends EventTarget {
     if (!ref) return [];
     const members = this.engine.convs.get(ref.conv).members;
     const now = Date.now();
-    return [...this.net.peers.values()].filter((p) => p.authed && (p.ownDevice || members.includes(p.fp))
+    return [...this.net.peers.values()].filter((p) => p.authed && p.direct && (p.ownDevice || members.includes(p.fp))
       && !((this.skip.get(id + '|' + p.ek) || 0) > now));
   }
 

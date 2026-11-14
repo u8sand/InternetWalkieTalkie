@@ -17,7 +17,7 @@
 // that window could clone the identity, so the UI says so.
 
 import { RelayPool } from './signaling.js';
-import { dtlsFingerprint } from './peer.js';
+import { dtlsFingerprint, parseIceServers } from './peer.js';
 import { b64u, fromB64u, utf8, fromUtf8, hex, sha256, randomBytes, concat, pack, unpack, equalBytes } from './encoding.js';
 
 const subtle = globalThis.crypto.subtle;
@@ -169,7 +169,7 @@ export class LinkHost extends LinkBase {
     try { msg = await open(this.keys.sig, ev.content); } catch { return; }
     if (msg.type !== 'offer' || typeof msg.sdp !== 'string') return;
     this._status('connecting');
-    const pc = this.pc = new RTCPeerConnection({ iceServers: (this.engine.settings.iceServers || []).map((u) => ({ urls: u })) });
+    const pc = this.pc = new RTCPeerConnection({ iceServers: parseIceServers(this.engine.settings.iceServers) });
     pc.ondatachannel = (e) => this._onChannel(e.channel);
     pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') this._fail('Could not connect to the new device. ' + connectHelp(pc)); };
     await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
@@ -234,7 +234,7 @@ export class LinkJoin extends LinkBase {
     j.pool.addEventListener('event', (e) => j._onSignal(e.detail));
     j.expiry = setTimeout(() => j._fail('Timed out. Make sure the other device is still showing the code.'), LINK_TTL_MS);
 
-    const pc = j.pc = new RTCPeerConnection({ iceServers: (Array.isArray(info.i) ? info.i : []).map((u) => ({ urls: u })) });
+    const pc = j.pc = new RTCPeerConnection({ iceServers: parseIceServers(info.i) });
     pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') j._fail('Could not connect to the other device. ' + connectHelp(pc)); };
     j._onChannel(pc.createDataChannel('iwt-link', { ordered: true }));
     await pc.setLocalDescription(await pc.createOffer());

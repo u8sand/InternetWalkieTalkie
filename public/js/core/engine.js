@@ -31,6 +31,9 @@ export const DEFAULT_SETTINGS = {
   // Tell contacts when you've read their messages and when you're typing.
   // (Delivery is visible to them regardless: it's implied by what your device syncs.)
   receipts: true,
+  // Open direct device-to-device connections (fast, needed for files; shows contacts your IP
+  // address). When off, or when none can form, messages travel through the relays instead.
+  directConnections: true,
 };
 
 const MAX_MAILBOXES = 4;

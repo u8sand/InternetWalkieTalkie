@@ -365,6 +365,27 @@ try {
   await send(dave, 'Hi Alice, Dave here');
   await openChatWith(alice, 'Dave');
   await expectMsg(alice, 'Hi Alice, Dave here', 30000);
+  const daveFp = await fp(dave);
+  await alice.page.waitForFunction((f) => window.__iwt.net.route(f) === 'direct', daveFp, { timeout: 30000 });
+  await alice.page.waitForSelector('#chatSub:has-text("direct connection")');
+
+  step('no direct connection possible: messages travel through the relay instead, and the app says so');
+  // Dave switches direct connections off, which is also what a network that blocks them looks like.
+  await dave.page.evaluate(() => window.__iwt.engine.saveSettings({ directConnections: false }));
+  await alice.page.waitForFunction((f) => window.__iwt.net.route(f) === 'relay', daveFp, { timeout: 45000 });
+  await dave.page.waitForFunction((f) => window.__iwt.net.route(f) === 'relay', aliceFp, { timeout: 45000 });
+  await send(dave, 'Sent with no direct connection');
+  await expectMsg(alice, 'Sent with no direct connection', 30000);
+  await send(alice, 'Got it, through the relay');
+  await expectMsg(dave, 'Got it, through the relay', 30000);
+  await alice.page.waitForSelector('#chatSub:has-text("through a relay")');
+  await dave.page.waitForSelector('#chatSub:has-text("through a relay")');
+  // Receipts work over the relay too: Alice has the chat open, so Dave sees two ticks.
+  await dave.page.waitForSelector('.msg.mine:has-text("Sent with no direct connection") .tick.read', { timeout: 30000 });
+  await shot(dave, '9-relayed');
+  // Back on: they return to a direct connection.
+  await dave.page.evaluate(() => window.__iwt.engine.saveSettings({ directConnections: true }));
+  await alice.page.waitForFunction((f) => window.__iwt.net.route(f) === 'direct', daveFp, { timeout: 60000 });
 
   step('after Alice resets her link, the old one only produces a contact request');
   await alice.page.click('#btnSettings');

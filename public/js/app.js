@@ -540,7 +540,7 @@ async function showContact(fp) {
   openDialog(engine.displayName(fp),
     h('div', { class: 'row' }, avatar(fp, engine.displayName(fp), net.isOnline(fp)),
       h('div', {}, h('div', { class: 'strong', text: k?.name || '(no name)' }),
-        h('div', { class: 'muted small', text: net.isOnline(fp) ? 'Online now, connected directly' : engine.seen[fp] ? 'Last seen ' + fmtAgo(engine.seen[fp]) : 'Not connected' }))),
+        h('div', { class: 'muted small', text: net.isOnline(fp) ? 'Online now, ' + ROUTE_TEXT[net.route(fp)] : engine.seen[fp] ? 'Last seen ' + fmtAgo(engine.seen[fp]) : 'Not connected' }))),
     c ? h('label', {}, 'Nickname (only you see this)', nick) : h('p', { class: 'muted small', text: 'Not in your contacts — known because you share a group.' }),
     h('h3', { text: 'Safety number' }),
     h('div', { class: 'safety', text: safety }),
@@ -628,6 +628,7 @@ function showSettings() {
   const bgStatus = h('div', { class: 'muted small', text: 'Background checks: …' });
   backgroundSyncState().then((st) => { bgStatus.textContent = 'Background checks: ' + BG_TEXT[st]; });
   const notif = h('input', { type: 'checkbox', checked: !!s.notifications });
+  const direct = h('input', { type: 'checkbox', checked: s.directConnections !== false, 'aria-label': 'Connect directly' });
   const receipts = h('input', { type: 'checkbox', checked: s.receipts !== false, 'aria-label': 'Send read receipts and typing indicators' });
   const pass = h('input', { type: 'password', placeholder: 'Backup passphrase', autocomplete: 'new-password' });
 
@@ -638,7 +639,8 @@ function showSettings() {
     h('details', { class: 'advanced' }, h('summary', { text: 'Advanced: network settings' }),
       h('p', { class: 'muted small', text: 'You don\'t need to change these. They control how your device finds the people you talk to.' }),
       h('label', {}, 'Meeting points (Nostr relays, one per line). Used only to help devices find each other; they never see anything readable.', relays),
-      h('label', {}, 'STUN/TURN servers (one per line). Help devices connect through home routers. Leave empty for the local network only.', ice),
+      h('label', {}, 'STUN/TURN servers (one per line). Help devices connect through home routers. A TURN server carries the connection when devices can\'t reach each other directly; put its username and password after the address, e.g. turn:turn.example.org:3478 name password', ice),
+      h('label', { class: 'row' }, direct, h('span', { text: 'Connect directly to the people I talk to (faster, and needed for photos and files; they can see my network address). When this is off, or devices can\'t reach each other, messages travel through the meeting points instead.' })),
       h('label', {}, 'Your mailbox (optional, up to 4 Nostr relays you run or trust). People can leave encrypted messages there while your app is closed; they\'re kept for at most 7 days. Without one, messages wait until you\'re both online.', mailbox),
       bgStatus,
       h('h3', { text: 'Your fingerprint' }),
@@ -646,13 +648,14 @@ function showSettings() {
     h('div', { class: 'row end' }, h('button', { class: 'primary', text: 'Save settings', onclick: async () => {
       if (name.value.trim() && name.value !== engine.identity.name) await engine.setName(name.value);
       const lines = (t) => t.value.split(/\s+/).map((x) => x.trim()).filter(Boolean);
+      const rows = (t) => t.value.split(/\n+/).map((x) => x.trim()).filter(Boolean); // a TURN line has spaces
       if (notif.checked && 'Notification' in window && Notification.permission !== 'granted') {
         const p = await Notification.requestPermission();
         if (p !== 'granted') notif.checked = false;
       }
       const mb = lines(mailbox);
       if (mb.some((u) => !/^wss?:\/\//.test(u))) return toast('Mailbox relays must start with wss://');
-      await engine.saveSettings({ relays: lines(relays), iceServers: lines(ice), mailboxRelays: mb, notifications: notif.checked, receipts: receipts.checked });
+      await engine.saveSettings({ relays: lines(relays), iceServers: rows(ice), mailboxRelays: mb, notifications: notif.checked, receipts: receipts.checked, directConnections: direct.checked });
       setupBackgroundSync();
       toast('Saved'); closeDialog(); render();
     } })),
@@ -895,7 +898,7 @@ function renderLists() {
       avatar(c.fp, engine.displayName(c.fp), net.isOnline(c.fp)),
       h('div', { class: 'info' },
         h('div', { class: 'title' }, h('span', { text: engine.displayName(c.fp) })),
-        h('div', { class: 'preview', text: net.isOnline(c.fp) ? 'Online' : engine.seen[c.fp] ? 'Last seen ' + fmtAgo(engine.seen[c.fp]) : 'Offline' })))) : (reqs.length ? [] : [h('li', { class: 'empty' }, h('p', { text: 'No contacts yet.' }), h('button', { class: 'primary', text: 'Invite someone', onclick: () => showAddContact() }))])),
+        h('div', { class: 'preview', text: net.isOnline(c.fp) ? 'Online · ' + ROUTE_SHORT[net.route(c.fp)] : engine.seen[c.fp] ? 'Last seen ' + fmtAgo(engine.seen[c.fp]) : 'Offline' })))) : (reqs.length ? [] : [h('li', { class: 'empty' }, h('p', { text: 'No contacts yet.' }), h('button', { class: 'primary', text: 'Invite someone', onclick: () => showAddContact() }))])),
   );
 
   renderSearch();
@@ -903,6 +906,15 @@ function renderLists() {
   document.title = (totalUnread ? `(${totalUnread}) ` : '') + 'Walkie-Talkie';
   navigator.setAppBadge?.(totalUnread).catch?.(() => {});
 }
+
+// How traffic reaches someone who is online: straight between the two devices, through a
+// TURN server, or through the meeting-point relays (when no direct connection can form).
+const ROUTE_TEXT = {
+  direct: 'direct connection',
+  turn: 'through a TURN server',
+  relay: 'through a relay (photos and files wait for a direct connection)',
+};
+const ROUTE_SHORT = { direct: 'direct', turn: 'via TURN server', relay: 'via relay' };
 
 function renderChat() {
   const has = !!currentConv && engine.convs.has(currentConv);
@@ -920,7 +932,7 @@ function renderChat() {
     $('chatSub').textContent = typingNow;
   } else if (conv.kind === 'direct') {
     const other = conv.members.find((m) => m !== me);
-    $('chatSub').textContent = net.isOnline(other) ? '● Online now · messages arrive instantly' : (engine.seen[other]
+    $('chatSub').textContent = net.isOnline(other) ? '● Online now · ' + ROUTE_TEXT[net.route(other)] : (engine.seen[other]
       ? `Last seen ${fmtAgo(engine.seen[other])}` : 'Not online') + ' · messages are delivered when they open the app';
   } else {
     const on = conv.members.filter((m) => m !== me && net.isOnline(m)).length;

@@ -19,6 +19,7 @@ const ASSETS = [
   'js/core/link.js',
   'js/core/net.js',
   'js/core/peer.js',
+  'js/core/relaysession.js',
   'js/core/schnorr.js',
   'js/core/signaling.js',
   'js/core/store.js',
