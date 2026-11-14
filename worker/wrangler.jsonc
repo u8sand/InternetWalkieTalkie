@@ -1,0 +1,20 @@
+{
+  // Walkie-Talkie relay on Cloudflare Workers. Works on the free plan: one SQLite-backed
+  // Durable Object, hibernating WebSockets.
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "walkie-talkie-relay",
+  "main": "src/index.js",
+  "compatibility_date": "2026-04-07",
+  "durable_objects": {
+    "bindings": [{ "name": "RELAY", "class_name": "Relay" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay"] }],
+  "observability": { "enabled": true },
+  // Optional settings (uncomment to change the defaults).
+  "vars": {
+    // "RELAY_NAME": "My Walkie-Talkie relay",
+    // "MAIL_TTL_DAYS": "8",
+    // "MAX_STORED_MB": "100",
+    // "TURN_TTL_HOURS": "12"
+  }
+}

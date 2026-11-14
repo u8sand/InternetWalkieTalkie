@@ -297,7 +297,8 @@ function showHowItWorks() {
     h('div', {}, h('h3', { text: title }), ...body.map((t) => h('p', { text: t }))));
   openDialog('How Walkie-Talkie works',
     sec('📻', 'Like a walkie-talkie',
-      'When you send a message, it goes straight from your device to the other person\'s, in real time, as long as they have the app open. There\'s no company server in the middle storing or passing on your conversations.'),
+      'When you send a message, it goes straight from your device to the other person\'s, in real time, as long as they have the app open. There\'s no company server in the middle storing your conversations.',
+      'Some networks don\'t let two devices reach each other directly. Then the app passes your (still scrambled) messages through a relay instead, and says so under the person\'s name: "direct connection", "through a relay" or "through a TURN server".'),
     sec('⏳', 'When they\'re not listening',
       'Unlike a walkie-talkie, nothing is lost. If they don\'t have the app open, your message waits safely on your device and is sent the moment you\'re both online. Under each message: ◷ waiting, ✓ delivered, ✓✓ read.',
       'In a group, anyone in it who is online passes messages along, so the chat keeps flowing even if not everyone is around at once.'),

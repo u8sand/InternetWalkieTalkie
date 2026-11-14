@@ -1,0 +1,30 @@
+{
+  "name": "walkie-talkie-relay-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Walkie-Talkie relay on Cloudflare Workers: signalling, mailbox and TURN credentials",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4",
+    "ws": "^8.18.0"
+  },
+  "cloudflare": {
+    "label": "Walkie-Talkie relay",
+    "bindings": {
+      "TURN_KEY_ID": {
+        "description": "Optional. Token ID of a TURN key (Cloudflare dashboard \u2192 Realtime \u2192 TURN Server \u2192 Create). Lets the relay carry connections that can't be made directly. Leave empty to skip."
+      },
+      "TURN_KEY_API_TOKEN": {
+        "description": "Optional. The API token shown when you created that TURN key."
+      },
+      "ACCESS_CODE": {
+        "description": "Optional. A code people must enter in the app before this relay hands out TURN access (which counts against your Cloudflare usage)."
+      }
+    }
+  }
+}

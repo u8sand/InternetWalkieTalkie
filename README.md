@@ -317,10 +317,15 @@ The app then keeps working in one of two ways, and shows which under the contact
 
 #### Your own relay
 
-`relay/` is a Docker Compose stack anyone can run, including on a Raspberry Pi: a small relay
-(meeting point and mailbox, accepting only this app's two encrypted event kinds) plus a
-[coturn](https://github.com/coturn/coturn) TURN server and optional automatic HTTPS. See
-[relay/README.md](relay/README.md). In the app it is one setting, **Settings → My relay**: the
+Two ways to run one, both giving the same relay (meeting point and mailbox, accepting only this
+app's two encrypted event kinds, plus TURN for carrying connections):
+
+- **Cloudflare, free, nothing to host** (`worker/`): a one-click **Deploy to Cloudflare** button
+  puts it on your own Cloudflare account; TURN comes from Cloudflare's TURN service. See
+  [worker/README.md](worker/README.md).
+- **Your own machine, including a Raspberry Pi** (`relay/`): a Docker Compose stack with a
+  [coturn](https://github.com/coturn/coturn) TURN server and optional automatic HTTPS. See
+  [relay/README.md](relay/README.md). In the app it is one setting, **Settings → My relay**: the
 address is added to your meeting points and mailbox, and the app fetches short-lived TURN
 credentials from it (renewed automatically, never stored).
 

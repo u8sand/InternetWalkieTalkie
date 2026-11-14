@@ -1,0 +1,8 @@
+# Secrets for the relay. All optional: without a TURN key the relay still works as a meeting
+# point and mailbox, it just can't carry connections that fail to form directly.
+#
+# Cloudflare dashboard → Realtime → TURN Server → Create: gives a Token ID and an API token.
+TURN_KEY_ID=
+TURN_KEY_API_TOKEN=
+# A code people must enter in the app (Settings → My relay → Access code) to use your TURN key.
+ACCESS_CODE=
