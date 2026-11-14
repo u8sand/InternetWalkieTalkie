@@ -10,6 +10,7 @@ import { RelayPool, inboxTopic, utcDay, postMail, MAIL_KIND, MAIL_TTL_S } from '
 import { sealSignal, openSignal } from './crypto.js';
 import { pack, unpack } from './encoding.js';
 import { opKey } from './engine.js';
+import { FileFetcher } from './fetch.js';
 
 const HELLO_EVERY_MS = 20000;
 const debug = (...a) => { if (globalThis.IWT_DEBUG) console.log('[net]', ...a); };
@@ -33,6 +34,7 @@ export class Network extends EventTarget {
     this.rcptLive = new Set();    // convs whose receipt should go to connected members soon
     this.rcptMail = new Map();    // fp -> Set<conv>: receipts to mail to members who are offline
     this.lastRcptMail = new Map();
+    this.files = new FileFetcher(this, engine);
     this.pool = new RelayPool();
     this.pool.addEventListener('event', (e) => this._onRelayEvent(e.detail));
     this.pool.addEventListener('status', (e) => this._emit('relays', e.detail));
@@ -61,6 +63,7 @@ export class Network extends EventTarget {
   }
 
   start() {
+    this.files.start();
     this._setRelays();
     this._refreshTopics();
     this.timer = setInterval(() => {
@@ -331,6 +334,7 @@ export class Network extends EventTarget {
   _newPeer(opts) {
     const peer = new Peer(this.engine, { timeoutMs: 20000, ...opts, iceServers: this.engine.settings.iceServers });
     this.pending.set(peer.sid, peer);
+    this.files.attach(peer);
     peer.addEventListener('ready', async () => {
       this.pending.delete(peer.sid);
       const fp = peer.remote.fp;
@@ -481,6 +485,7 @@ export class Network extends EventTarget {
 
   stop() {
     clearInterval(this.timer);
+    this.files.stop();
     this.pool.close();
     for (const p of [...this.peers.values(), ...this.pending.values()]) p.close();
   }

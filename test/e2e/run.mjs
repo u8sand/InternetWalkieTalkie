@@ -92,6 +92,16 @@ async function send(u, text) {
 
 const expectMsg = (u, text, timeout = 20000) => u.page.waitForSelector(`#messages .msg:has-text("${text}")`, { timeout });
 
+/** Pick files with the 📎 button. */
+const attach = (u, ...files) => u.page.setInputFiles('#fileInput', files);
+const fileId = (u, name) => u.page.evaluate((n) => window.__iwt.engine.fileRef && [...window.__iwt.engine.views.values()]
+  .flatMap((v) => v.list()).find((m) => m.file?.name === n)?.file.id, name);
+const sha = (u, id) => u.page.evaluate(async (i) => {
+  const b = await window.__iwt.engine.readFile(i);
+  return b && [...new Uint8Array(await crypto.subtle.digest('SHA-256', b))].map((x) => x.toString(16).padStart(2, '0')).join('');
+}, id);
+const randomBytes = (n) => Buffer.from(Array.from({ length: n }, (_, i) => (i * 7919 + (i >> 8)) & 255));
+
 const shot = async (u, name) => { if (SHOTS) await u.page.screenshot({ path: `${SHOTS}/${name}.png` }); };
 
 try {
@@ -148,6 +158,26 @@ try {
   await bob.page.click('dialog button:has-text("Delete for me")');
   await bob.page.waitForSelector('.msg:has-text("Bob will delete this one")', { state: 'detached' });
   assert.ok(await alice.page.isVisible('.msg:has-text("Bob will delete this one")'), "Alice's copy stays");
+
+  step('photos are resized and re-encoded; files arrive intact in chunks, with a caption');
+  const png = Buffer.from(await alice.page.evaluate(async () => {
+    const c = document.createElement('canvas'); c.width = 3000; c.height = 1500;
+    const x = c.getContext('2d'); x.fillStyle = '#c33'; x.fillRect(0, 0, 3000, 1500); x.fillStyle = '#33c'; x.fillRect(0, 0, 1500, 1500);
+    return [...new Uint8Array(await (await new Promise((r) => c.toBlob(r, 'image/png'))).arrayBuffer())];
+  }));
+  await attach(alice, { name: 'holiday.png', mimeType: 'image/png', buffer: png });
+  const img = await bob.page.waitForSelector('.msg .att img.att-img[src^="blob:"]', { timeout: 20000 });
+  assert.equal(await img.evaluate((i) => i.naturalWidth), 2048, 'scaled to 2048 px');
+  assert.match(await img.evaluate((i) => i.alt), /^holiday\.(webp|jpg)$/);
+  const notes = randomBytes(300 * 1024); // 5 chunks
+  await alice.page.fill('#composerInput', 'here are the notes');
+  await attach(alice, { name: 'notes.bin', mimeType: 'application/octet-stream', buffer: notes });
+  await bob.page.waitForSelector('.msg:has-text("here are the notes") .att-file:has-text("notes.bin") .att-save', { timeout: 30000 });
+  const notesId = await fileId(bob, 'notes.bin');
+  const { createHash } = await import('node:crypto');
+  assert.equal(await sha(bob, notesId), createHash('sha256').update(notes).digest('hex'), 'byte-for-byte');
+  assert.equal(await alice.page.inputValue('#composerInput'), '', 'caption sent with the file');
+  await shot(bob, '2b-files');
 
   step('Bob goes offline; Alice keeps writing; Bob catches up on return');
   await bob.page.close();
@@ -254,6 +284,10 @@ try {
   // Carol (never connected to Bob) has the group open: her signed read receipt reaches Bob via Alice.
   await bob.page.waitForSelector('.msg.mine:has-text("Bob says hi to the group") .tick.read', { timeout: 15000 });
   assert.ok(!(await bob.page.evaluate((f) => window.__iwt.net.isOnline(f), carolFp)), 'Bob and Carol are not connected');
+  // A file from Bob reaches Carol the same way: Alice fetches it, then serves it on.
+  await attach(bob, { name: 'plan.txt', mimeType: 'text/plain', buffer: Buffer.from('group plan: meet at noon') });
+  await carol.page.waitForSelector('.att-file:has-text("plan.txt") .att-save', { timeout: 30000 });
+  assert.equal(await carol.page.evaluate(async (id) => new TextDecoder().decode(await window.__iwt.engine.readFile(id)), await fileId(carol, 'plan.txt')), 'group plan: meet at noon');
   await shot(bob, '4-group');
 
   step("Bob links his phone by opening the QR link; it gets his identity and full history");
@@ -291,6 +325,9 @@ try {
   await expectMsg(bob, 'Reaches both of your devices', 30000);
   await openChatWith(alice, 'Walkie crew');
   await openChatWith(bob, 'Walkie crew');
+  // The phone's history came without attachments (they aren't in the link); it fetches them.
+  await until(() => phone.page.evaluate((id) => window.__iwt.engine.hasFile(id), notesId), 30000, 'phone fetching files');
+  assert.equal(await sha(phone, notesId), createHash('sha256').update(notes).digest('hex'));
 
   step('all replicas, including both of Bob\'s devices, converge on identical history');
   const history = (u) => u.page.evaluate(() => {
@@ -303,7 +340,7 @@ try {
   assert.deepEqual(ha, hb);
   assert.deepEqual(hb, hc);
   assert.deepEqual(hc, hp);
-  assert.equal(ha.length, 4);
+  assert.equal(ha.length, 5); // including Bob's plan.txt
 
   step('a brand-new person opens Alice\'s link: setup says who invited them, then they\'re connected');
   const daveCtx = await browser.newContext({ ...devices['iPhone 13'] });

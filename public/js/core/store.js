@@ -2,8 +2,9 @@
 // plaintext exists in memory only.
 
 // 'inbox' holds raw (still encrypted) mailbox events fetched by the service worker in the background.
-export const STORES = ['kv', 'contacts', 'convs', 'ops', 'requests', 'inbox'];
-export const DB_VERSION = 2;
+// 'blobs' holds encrypted attachment chunks, keyed "<fileId>|<index>".
+export const STORES = ['kv', 'contacts', 'convs', 'ops', 'requests', 'inbox', 'blobs'];
+export const DB_VERSION = 3;
 
 export class MemoryStore {
   constructor() {
@@ -13,6 +14,7 @@ export class MemoryStore {
   async put(store, key, value) { this.data[store].set(key, structuredClone(value)); }
   async del(store, key) { this.data[store].delete(key); }
   async all(store) { return [...this.data[store].values()].map((v) => structuredClone(v)); }
+  async keys(store) { return [...this.data[store].keys()]; }
   async clear() { for (const s of STORES) this.data[s].clear(); }
 }
 
@@ -53,6 +55,7 @@ export class IDBStore {
   put(store, key, value) { return this._tx(store, 'readwrite', (s) => s.put(value, key)).then(() => {}); }
   del(store, key) { return this._tx(store, 'readwrite', (s) => s.delete(key)).then(() => {}); }
   all(store) { return this._tx(store, 'readonly', (s) => s.getAll()); }
+  keys(store) { return this._tx(store, 'readonly', (s) => s.getAllKeys()); }
 
   async clear() {
     for (const s of STORES) await this._tx(s, 'readwrite', (st) => st.clear());

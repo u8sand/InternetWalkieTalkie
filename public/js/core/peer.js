@@ -19,6 +19,8 @@
 import { sign, verify, importCard, authTranscript } from './crypto.js';
 import { b64u, fromB64u, randomBytes } from './encoding.js';
 
+const MAX_WANT = 16; // chunks per request
+
 const BATCH_BYTES = 48 * 1024;
 const RESYNC_MS = 60000;
 const debug = (...a) => { if (globalThis.IWT_DEBUG) console.log('[peer]', ...a); };
@@ -216,6 +218,39 @@ export class Peer extends EventTarget {
       return;
     }
 
+    // Attachments: {t:'fwant', id, idx:[…]} → one {t:'fchunk', id, i, d} per chunk we hold,
+    // then {t:'fnone', id, idx:[…]} listing any we don't.
+    if (msg.t === 'fwant' && typeof msg.id === 'string' && Array.isArray(msg.idx)) {
+      if (!this.engine.canServe(msg.id, this.remote.fp)) return this._send({ t: 'fnone', id: msg.id, idx: msg.idx.slice(0, MAX_WANT) });
+      const none = [];
+      for (const i of msg.idx.slice(0, MAX_WANT)) {
+        const ct = Number.isSafeInteger(i) ? await this.engine.readChunk(msg.id, i) : null;
+        if (!ct) { none.push(i); continue; }
+        await this._drain();
+        this._send({ t: 'fchunk', id: msg.id, i, d: b64u(ct) });
+      }
+      if (none.length) this._send({ t: 'fnone', id: msg.id, idx: none });
+      return;
+    }
+
+    if (msg.t === 'fchunk' && typeof msg.id === 'string' && typeof msg.d === 'string') {
+      let ct;
+      try { ct = fromB64u(msg.d); } catch { return; }
+      const ok = await this.engine.putChunk(msg.id, msg.i, ct);
+      this.dispatchEvent(new CustomEvent('fchunk', { detail: { id: msg.id, i: msg.i, ok } }));
+      return;
+    }
+
+    if (msg.t === 'fhave' && typeof msg.id === 'string') {
+      this.dispatchEvent(new CustomEvent('fhave', { detail: { id: msg.id } }));
+      return;
+    }
+
+    if (msg.t === 'fnone' && typeof msg.id === 'string' && Array.isArray(msg.idx)) {
+      this.dispatchEvent(new CustomEvent('fnone', { detail: { id: msg.id, idx: msg.idx.slice(0, MAX_WANT) } }));
+      return;
+    }
+
     if (msg.t === 'typing' && !this.ownDevice && typeof msg.conv === 'string') {
       if (this.engine.convs.get(msg.conv)?.members.includes(this.remote.fp)) {
         this.dispatchEvent(new CustomEvent('typing', { detail: { fp: this.remote.fp, conv: msg.conv, on: !!msg.on } }));
@@ -265,6 +300,15 @@ export class Peer extends EventTarget {
 
   sendSigned(list) {
     if (this.authed && !this.ownDevice && list.length) this._send({ t: 'rcpt', list });
+  }
+
+  /** We now hold all of a file: anyone who asked us too early can ask again. */
+  announceFile(id) {
+    if (this.authed && this.engine.canServe(id, this.remote.fp)) this._send({ t: 'fhave', id });
+  }
+
+  requestChunks(id, idx) {
+    return this._send({ t: 'fwant', id, idx: idx.slice(0, MAX_WANT) });
   }
 
   sendTyping(conv, on) {

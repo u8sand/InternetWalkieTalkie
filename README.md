@@ -42,6 +42,11 @@ Progressive Web App on GitHub Pages.
      **Delete chat** (tap the chat title) clears a whole conversation, e.g. with a contact you
      removed. The chat leaves your list until someone writes in it again.
    - **Search** (above the chat list) looks through every conversation on this device.
+   - **Photos and files** (📎, paste, or drag and drop; up to 25 MB): photos are scaled to at most
+     2048 px and re-encoded, which also strips EXIF data such as location. GIFs are sent as is.
+     The message arrives like any other (by mailbox too, with a small blurred preview). The file
+     itself downloads directly from whoever is connected and has it: the sender, any group member,
+     or your own other device.
 4. **Groups**: any member who is online passes updates along to the others. So Bob and Carol can
    sync through Alice even if they never connect directly.
 5. **Direct connection codes** (Settings): connect with no relay at all by swapping two codes
@@ -129,6 +134,25 @@ the message, and it is never sent to anyone. Your own messages keep their encryp
 until they expire, so members who haven't received them yet still can. A chat is cleared by
 recording, per stream, the highest seq you held. Copies that arrive later (say, from a slow
 member) are dropped on arrival. Your devices exchange these marks along with the address book.
+
+#### Attachments (`js/core/files.js`, `js/core/fetch.js`)
+
+- A file message is an ordinary `msg` op whose body carries `file: {id, name, mime, size, key,
+  thumb?}`. `key` is a fresh AES-256-GCM key for that file only. Because it's inside the op, only
+  members ever get it.
+- The file is split into 64 KB chunks. Each chunk is encrypted under a nonce derived from its
+  index, with `id|index|count` as associated data, so chunks can't be altered, swapped, reordered
+  or truncated. Chunks are stored encrypted (IndexedDB store `blobs`).
+- Chunks travel over the DataChannel: `fwant` (up to 16 indices) is answered with `fchunk`s, plus
+  `fnone` for any chunk the sender lacks.
+- Any connected member of the conversation, or one of our own devices, can serve chunks. That
+  covers the sender, the people the file was relayed through, and a newly linked device.
+- `fhave` tells peers who asked too early that a device now holds the whole file.
+- A peer whose chunk fails authentication isn't asked again for a while.
+- Chunks are deleted with their message: deleted for everyone, deleted for me, or expired.
+- Files aren't put on mailbox relays; offline recipients get the message and preview first.
+- Only allow-listed image, video and audio types are shown inline. Everything else, including
+  SVG and HTML, is offered as a download only, through an `application/octet-stream` blob.
 
 #### Receipts
 
@@ -285,6 +309,7 @@ symmetric NATs.
 npm install
 npm test               # unit tests: crypto, CRDT convergence, expiry, multi-device streams and
                        # address-book merge, forgery rejection, receipts, local deletion, search,
+                       # attachments (chunk auth, relaying, clean-up),
                        # BIP-340 vectors
 npm run test:e2e       # 3 Chromium users, a "public" relay and a user-owned mailbox relay:
                        # relay/manual WebRTC, offline catch-up, mailbox delivery while never online

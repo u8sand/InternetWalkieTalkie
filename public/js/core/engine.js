@@ -8,6 +8,9 @@ import {
 } from './crypto.js';
 import { OpLog, ConversationView, msgId, streamOf, PINNED_TYPES } from './crdt.js';
 import { utf8, hex, sha256, b64u, fromB64u, randomBytes, canonical } from './encoding.js';
+import {
+  CHUNK, MAX_FILE_BYTES, chunkCount, cleanFileMeta, newFileId, newFileKey, importFileKey, encryptChunk, decryptChunk,
+} from './files.js';
 
 const newDeviceId = () => hex(randomBytes(8));
 const newInvite = () => ({ token: b64u(randomBytes(16)), at: Date.now() });
@@ -102,6 +105,8 @@ export class Engine extends EventTarget {
     // conv -> {upTo: vv, ids: Set<msgId>, hide}: messages deleted "for me" (this identity only).
     this.forgets = new Map();
     this.seen = {};             // fp -> ms: when we were last connected to them
+    this.chunks = new Map();    // file id -> Set<index> of encrypted chunks we hold
+    this._fileKeys = new Map(); // file id -> CryptoKey
     this.relayRcpt = new Map(); // group conv -> {fp -> signed receipt}: passed on to members who can't reach fp
     this.now = () => Date.now(); // overridable clock (tests)
     this._queue = Promise.resolve();
@@ -169,7 +174,13 @@ export class Engine extends EventTarget {
         if (env.author === this.identity.fp && env.dev === this.device && env.ts > this.lastTs) this.lastTs = env.ts;
       } catch (e) { console.warn('stored op unreadable', e); }
     }
+    for (const k of (await this.store.keys('blobs')) || []) {
+      const [id, i] = String(k).split('|');
+      if (!this.chunks.has(id)) this.chunks.set(id, new Set());
+      this.chunks.get(id).add(Number(i));
+    }
     await this._prune();
+    await this._gcFiles();
     await this._saveBackgroundConfig();
     return true;
   }
@@ -602,6 +613,7 @@ export class Engine extends EventTarget {
         await this.store.put('ops', opKey(env), stub);
       }
     }
+    await this._gcFiles();
   }
 
   /** "Delete for me": these messages disappear from all of our own devices only. */
@@ -634,6 +646,132 @@ export class Engine extends EventTarget {
     });
   }
 
+  // ------------------------------------------------------------ attachments
+
+  /**
+   * Send a file (already resized/re-encoded by the UI if it's a photo). Chunks are encrypted
+   * and stored first; members fetch them from us (or from each other) on demand.
+   * @param bytes Uint8Array
+   */
+  sendFile(convId, { bytes, name, mime, caption = '', thumb, w, h }) {
+    if (!(bytes instanceof Uint8Array) || !bytes.length) throw new Error('Empty file');
+    if (bytes.length > MAX_FILE_BYTES) throw new Error(`Files can be at most ${MAX_FILE_BYTES / 1048576} MB`);
+    const meta = cleanFileMeta({ id: newFileId(), key: newFileKey(), name, mime: mime || 'application/octet-stream', size: bytes.length, thumb, w, h });
+    if (!meta) throw new Error('Unsupported file');
+    return this._serial(async () => {
+      const key = await this._fileKey(meta);
+      const n = chunkCount(meta.size);
+      const have = new Set();
+      this.chunks.set(meta.id, have);
+      for (let i = 0; i < n; i++) {
+        const ct = await encryptChunk(key, meta.id, i, n, bytes.subarray(i * CHUNK, (i + 1) * CHUNK));
+        await this.store.put('blobs', meta.id + '|' + i, ct);
+        have.add(i);
+      }
+      return this._send(convId, { type: 'msg', text: String(caption).slice(0, 20000), file: meta, ts: Date.now() });
+    });
+  }
+
+  async _fileKey(meta) {
+    let k = this._fileKeys.get(meta.id);
+    if (!k) { k = await importFileKey(meta.key); this._fileKeys.set(meta.id, k); }
+    return k;
+  }
+
+  /** {conv, msg, file} for a file id referenced by a visible message, or null. */
+  fileRef(id) {
+    if (!this._fileIndex) {
+      this._fileIndex = new Map();
+      for (const [conv, view] of this.views) {
+        for (const msg of view.messages.values()) if (msg.file) this._fileIndex.set(msg.file.id, { conv, msg, file: msg.file });
+      }
+    }
+    const ref = this._fileIndex.get(id);
+    return ref && ref.msg.file?.id === id ? ref : null;
+  }
+
+  fileProgress(id) {
+    const ref = this.fileRef(id);
+    if (!ref) return null;
+    const total = chunkCount(ref.file.size);
+    return { have: this.chunks.get(id)?.size || 0, total };
+  }
+
+  hasFile(id) {
+    const p = this.fileProgress(id);
+    return !!p && p.have >= p.total;
+  }
+
+  /** Files referenced by visible messages that we don't fully hold yet. */
+  incompleteFiles() {
+    const out = [];
+    for (const [conv, view] of this.views) {
+      for (const msg of view.messages.values()) {
+        if (!msg.file) continue;
+        const n = chunkCount(msg.file.size);
+        const have = this.chunks.get(msg.file.id);
+        if (!have || have.size < n) out.push({ conv, file: msg.file, missing: [...Array(n).keys()].filter((i) => !have?.has(i)) });
+      }
+    }
+    return out;
+  }
+
+  /** May peer `fp` (an identity) receive this file? Members of its conversation, or our own devices. */
+  canServe(id, fp) {
+    const ref = this.fileRef(id);
+    return !!ref && (fp === this.identity.fp || this.convs.get(ref.conv).members.includes(fp));
+  }
+
+  async readChunk(id, i) {
+    if (!this.chunks.get(id)?.has(i)) return null;
+    return this.store.get('blobs', id + '|' + i);
+  }
+
+  /** Store a chunk fetched from a peer if it authenticates. Returns true if new and valid. */
+  async putChunk(id, i, ct) {
+    const ref = this.fileRef(id);
+    if (!ref || !(ct instanceof Uint8Array)) return false;
+    const n = chunkCount(ref.file.size);
+    if (!Number.isSafeInteger(i) || i < 0 || i >= n) return false;
+    const have = this.chunks.get(id) || new Set();
+    if (have.has(i)) return false;
+    const expect = i < n - 1 ? CHUNK : ref.file.size - (n - 1) * CHUNK;
+    try {
+      const pt = await decryptChunk(await this._fileKey(ref.file), id, i, n, ct);
+      if (pt.length !== expect) return false;
+    } catch { return false; }
+    await this.store.put('blobs', id + '|' + i, ct);
+    have.add(i);
+    this.chunks.set(id, have);
+    if (have.size === n) this._emit('file', { id, conv: ref.conv, done: true });
+    return true;
+  }
+
+  /** The whole decrypted file, or null if we don't hold all of it yet. */
+  async readFile(id) {
+    const ref = this.fileRef(id);
+    if (!ref || !this.hasFile(id)) return null;
+    const n = chunkCount(ref.file.size);
+    const key = await this._fileKey(ref.file);
+    const out = new Uint8Array(ref.file.size);
+    for (let i = 0; i < n; i++) out.set(await decryptChunk(key, id, i, n, await this.store.get('blobs', id + '|' + i)), i * CHUNK);
+    return out;
+  }
+
+  /** Delete chunks of files no visible message refers to any more (deleted, expired, deleted for me). */
+  async _gcFiles() {
+    this._fileIndex = null;
+    if (!this.chunks.size) return;
+    const live = new Set();
+    for (const view of this.views.values()) for (const m of view.messages.values()) if (m.file) live.add(m.file.id);
+    for (const [id, have] of [...this.chunks]) {
+      if (live.has(id)) continue;
+      for (const i of have) await this.store.del('blobs', id + '|' + i);
+      this.chunks.delete(id);
+      this._fileKeys.delete(id);
+    }
+  }
+
   // ------------------------------------------------------------ search
 
   /** Messages containing every word of `query`, newest first. */
@@ -644,7 +782,7 @@ export class Engine extends EventTarget {
     for (const conv of this.convs.values()) {
       for (const m of this.views.get(conv.id).list()) {
         if (m.deleted) continue;
-        const t = fold(m.text);
+        const t = fold(m.file ? m.text + ' ' + m.file.name : m.text);
         if (words.every((w) => t.includes(w))) out.push({ conv: conv.id, msg: m });
       }
     }
@@ -685,7 +823,7 @@ export class Engine extends EventTarget {
         if (f.ids.size !== n) await this._saveForgets();
       }
     }
-    if (changed) this._emit('change', { what: 'expired' });
+    if (changed) { await this._gcFiles(); this._emit('change', { what: 'expired' }); }
     return changed;
   }
 
@@ -736,6 +874,7 @@ export class Engine extends EventTarget {
     }, body);
     await this.store.put('ops', opKey(env), env);
     this._applyOp(env, body);
+    if (body.type === 'del') await this._gcFiles();
     this._emit('op', { env, body, conv: convId, local: true });
     return env;
   }
@@ -743,6 +882,7 @@ export class Engine extends EventTarget {
   _applyOp(env, body, hidden = false) {
     const log = this.logs.get(env.conv);
     if (!log.add(env, PINNED_TYPES.has(body.type))) return false;
+    this._fileIndex = null;
     if (!hidden) this.views.get(env.conv).apply(env, body);
     if (env.lamport > this.clock) this.clock = env.lamport;
     return true;
@@ -833,6 +973,7 @@ export class Engine extends EventTarget {
     const kept = forgotten && env.author !== me ? stubOf(env) : env;
     await this.store.put('ops', opKey(env), kept);
     this._applyOp(kept, body, forgotten);
+    if (body.type === 'del' || forgotten) await this._gcFiles();
     if (expired) {
       await this._prune();
       return { added: true, expired: true };

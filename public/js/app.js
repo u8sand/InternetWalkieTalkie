@@ -7,6 +7,7 @@ import { LinkHost, LinkJoin, LINK_TTL_MS } from './core/link.js';
 import { importCard, safetyNumber } from './core/crypto.js';
 import { b64u, fromB64u, utf8, fromUtf8 } from './core/encoding.js';
 import qrcode from './vendor/qrcode.js';
+import { MAX_FILE_BYTES, inlineKind } from './core/files.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -150,6 +151,154 @@ function parseCardInput(text) {
   try { return JSON.parse(fromUtf8(fromB64u(code))); } catch {}
   try { return JSON.parse(text); } catch {}
   throw new Error("That doesn't look like a contact link.");
+}
+
+// ------------------------------------------------------------------ attachments
+
+const PHOTO_MAX_PX = 2048;
+const THUMB_PX = 48;
+
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return Math.round(n / 1024) + ' KB';
+  return (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + ' MB';
+}
+
+function canvasBlob(canvas, type, quality) {
+  return new Promise((r) => canvas.toBlob(r, type, quality));
+}
+
+/**
+ * Photos are scaled down and re-encoded (WebP where the browser can, else JPEG). That keeps
+ * them small for everyone storing them, and drops EXIF metadata such as GPS location.
+ * GIFs are sent as they are, so they keep moving. Anything that won't decode is sent as a file.
+ */
+async function prepareFile(file) {
+  let mime = file.type || 'application/octet-stream';
+  if (/^image\/(jpeg|png|webp|avif|bmp|heic|heif)$/.test(mime) || mime === 'image/gif') {
+    try {
+      const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+      const draw = (max, bg) => {
+        const s = Math.min(1, max / Math.max(bmp.width, bmp.height));
+        const c = h('canvas', { width: Math.max(1, Math.round(bmp.width * s)), height: Math.max(1, Math.round(bmp.height * s)) });
+        const ctx = c.getContext('2d');
+        if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, c.width, c.height); }
+        ctx.drawImage(bmp, 0, 0, c.width, c.height);
+        return c;
+      };
+      const tc = draw(THUMB_PX, '#888');
+      let thumb = tc.toDataURL('image/webp', 0.5);
+      if (!thumb.startsWith('data:image/webp')) thumb = tc.toDataURL('image/jpeg', 0.5);
+      const meta = { thumb, w: bmp.width, h: bmp.height };
+      if (mime === 'image/gif') return { ...meta, bytes: new Uint8Array(await file.arrayBuffer()), name: file.name, mime };
+      let out = await canvasBlob(draw(PHOTO_MAX_PX), 'image/webp', 0.85);
+      if (out?.type !== 'image/webp') out = await canvasBlob(draw(PHOTO_MAX_PX, '#fff'), 'image/jpeg', 0.87);
+      const ext = out.type === 'image/webp' ? '.webp' : '.jpg';
+      const base = (file.name || 'photo').replace(/\.[^.]*$/, '') || 'photo';
+      const s = Math.min(1, PHOTO_MAX_PX / Math.max(bmp.width, bmp.height));
+      return { ...meta, w: Math.round(bmp.width * s), h: Math.round(bmp.height * s), bytes: new Uint8Array(await out.arrayBuffer()), name: base + ext, mime: out.type };
+    } catch { /* not decodable here: send the original as a file */ }
+  }
+  if (mime.startsWith('image/') && !inlineKind(mime)) mime = 'application/octet-stream'; // e.g. SVG: download only
+  return { bytes: new Uint8Array(await file.arrayBuffer()), name: file.name || 'file', mime };
+}
+
+async function sendFiles(files) {
+  if (!currentConv || !files.length) return;
+  const convId = currentConv;
+  const input = $('composerInput');
+  let caption = input.value.trim() ? input.value : '';
+  for (const f of files) {
+    if (f.size > MAX_FILE_BYTES * 4) { toast(`${f.name} is too large (max ${fmtSize(MAX_FILE_BYTES)})`); continue; }
+    try {
+      const p = await prepareFile(f);
+      if (p.bytes.length > MAX_FILE_BYTES) { toast(`${f.name} is too large (max ${fmtSize(MAX_FILE_BYTES)})`); continue; }
+      renderChat.forceScroll = true;
+      await engine.sendFile(convId, { ...p, caption });
+      if (caption) { caption = ''; input.value = ''; input.dispatchEvent(new Event('input')); }
+    } catch (e) {
+      toast(e.name === 'QuotaExceededError' ? 'This device is out of storage space' : 'Could not send ' + f.name + ': ' + e.message);
+    }
+  }
+}
+
+// One element per file, reused across renders so playing media and loaded images survive.
+const fileNodes = new Map(); // file id -> {el, done, url}
+
+async function fileBlobUrl(file) {
+  const bytes = await engine.readFile(file.id);
+  if (!bytes) return null;
+  // Never hand the browser an active type (HTML, SVG…) for a blob URL from our origin.
+  const type = inlineKind(file.mime) ? file.mime : 'application/octet-stream';
+  return URL.createObjectURL(new Blob([bytes], { type }));
+}
+
+async function saveFile(file) {
+  const url = fileNodes.get(file.id)?.url || await fileBlobUrl(file);
+  if (!url) return toast('Not downloaded yet');
+  const a = h('a', { href: url, download: file.name });
+  document.body.append(a); a.click(); a.remove();
+}
+
+function showImage(file, url) {
+  openDialog(file.name,
+    h('img', { class: 'viewer', src: url, alt: file.name }),
+    h('div', { class: 'row end', style: 'margin-top:.6em' },
+      h('span', { class: 'muted small grow', text: fmtSize(file.size) }),
+      h('button', { class: 'primary', text: 'Save', onclick: () => saveFile(file) })));
+}
+
+/** On-screen size for a photo: fits 320×320 (narrower on small screens), keeping its shape. */
+function photoStyle(file) {
+  if (!file.w || !file.h) return undefined;
+  const box = Math.min(320, Math.round(innerWidth * 0.62));
+  const s = Math.min(1, box / file.w, box / file.h);
+  return `width:${Math.max(48, Math.round(file.w * s))}px;height:${Math.max(48, Math.round(file.h * s))}px`;
+}
+
+function attachmentNode(m) {
+  const file = m.file;
+  let n = fileNodes.get(file.id);
+  if (!n) { n = { el: h('div', { class: 'att' }), done: false, building: false }; fileNodes.set(file.id, n); }
+  if (n.done || n.building) return n.el;
+  const kind = inlineKind(file.mime);
+  if (engine.hasFile(file.id)) {
+    n.building = true;
+    fileBlobUrl(file).then((url) => {
+      n.building = false;
+      if (!url) return;
+      n.url = url; n.done = true;
+      const media = kind === 'image'
+        ? h('img', { class: 'att-img', src: url, alt: file.name, onclick: () => showImage(file, url), style: photoStyle(file) })
+        : kind === 'video' ? h('video', { class: 'att-img', src: url, controls: true, preload: 'metadata', playsinline: true })
+        : kind === 'audio' ? h('audio', { src: url, controls: true, preload: 'metadata' })
+        : null;
+      n.el.replaceChildren(media || fileChip(file, null));
+      if (media && kind !== 'image') n.el.append(fileChip(file, null, true));
+    }).catch(() => { n.building = false; });
+    return n.el;
+  }
+  // Still fetching (or waiting for someone who has it to come online).
+  const st = net.files.status(file.id);
+  const pct = st ? Math.floor((st.have / st.total) * 100) : 0;
+  const label = st?.waiting ? (m.author === engine.identity.fp ? 'Waiting for one of your devices…' : `Waiting for ${engine.displayName(m.author)} or another member to come online`) : `Downloading… ${pct}%`;
+  n.el.replaceChildren(
+    kind === 'image' && file.thumb ? h('img', { class: 'att-img blur', src: file.thumb, alt: '', style: photoStyle(file) }) : null,
+    fileChip(file, label));
+  return n.el;
+}
+
+function fileChip(file, status, small) {
+  return h('div', { class: 'att-file' + (small ? ' small' : '') },
+    h('span', { class: 'att-icon', text: '📄' }),
+    h('div', { class: 'grow' }, h('div', { class: 'att-name', text: file.name }), h('div', { class: 'att-meta', text: status || fmtSize(file.size) })),
+    status ? null : h('button', { class: 'att-save', text: 'Save', onclick: () => saveFile(file) }));
+}
+
+function filePreview(m) {
+  if (!m.file) return m.text;
+  const icon = inlineKind(m.file.mime) === 'image' ? '📷 ' + (m.text || 'Photo') : inlineKind(m.file.mime) === 'video' ? '🎬 ' + (m.text || 'Video') : '📎 ' + (m.text || m.file.name);
+  return icon;
 }
 
 // ------------------------------------------------------------------ dialogs
@@ -404,14 +553,15 @@ function showMessage(convId, m) {
   const r = mine && !m.deleted ? engine.receiptState(convId, m) : null;
   const label = { read: 'Read', got: 'Delivered', relay: 'In their mailbox', null: 'Not delivered yet' };
   openDialog('Message',
-    m.deleted ? h('p', { class: 'muted', text: 'Message deleted' }) : h('div', { class: 'quote', text: m.text.length > 400 ? m.text.slice(0, 400) + '…' : m.text }),
+    m.deleted ? h('p', { class: 'muted', text: 'Message deleted' }) : h('div', { class: 'quote', text: m.file ? `${m.file.name} (${fmtSize(m.file.size)})${m.text ? '\n' + m.text : ''}` : m.text.length > 400 ? m.text.slice(0, 400) + '…' : m.text }),
     h('p', { class: 'muted small', text: `${mine ? 'You' : engine.displayName(m.author)} · ${fmtDay(m.ts)} ${fmtTime(m.ts)}` }),
     r ? h('ul', { class: 'list receipts' }, Object.entries(r.members).map(([fp, st]) => h('li', { class: 'static' },
       avatar(fp, engine.displayName(fp)),
       h('div', { class: 'info' }, h('div', { class: 'title' }, h('span', { text: engine.displayName(fp) })),
         h('div', { class: 'preview', text: label[st] }))))) : null,
     h('div', { class: 'row end', style: 'margin-top:1em' },
-      m.deleted ? null : h('button', { text: 'Copy text', onclick: () => { copy(m.text); closeDialog(); } }),
+      m.file && engine.hasFile(m.file.id) ? h('button', { text: 'Save file', onclick: () => saveFile(m.file) }) : null,
+      m.deleted || !m.text ? null : h('button', { text: 'Copy text', onclick: () => { copy(m.text); closeDialog(); } }),
       h('button', { text: 'Delete for me', title: 'Removes it from your devices only', onclick: async () => {
         await engine.forgetMessages(convId, [m.id]); selectedMsg = null; closeDialog();
       } }),
@@ -516,7 +666,7 @@ function showSettings() {
 
     h('div', { class: 'section' },
       h('h3', { text: 'Backup' }),
-      h('p', { class: 'muted small', text: 'Your identity and messages exist only on this device. Export an encrypted backup to move or restore them. Do not run the same identity on two devices at once.' }),
+      h('p', { class: 'muted small', text: 'Your identity and messages exist only on this device. Export an encrypted backup to move or restore them. Photos and files aren\'t included (a restored or linked device fetches them from your contacts and other devices).' }),
       pass,
       h('div', { class: 'row end', style: 'margin-top:.5em' },
         h('button', { text: 'Export backup', onclick: async () => {
@@ -698,7 +848,7 @@ function renderLists() {
     const other = conv.kind === 'direct' ? conv.members.find((m) => m !== engine.identity.fp) : null;
     const online = other ? net.isOnline(other) : conv.members.some((m) => m !== engine.identity.fp && net.isOnline(m));
     const typingNow = typingText(conv.id, conv.kind === 'group');
-    const preview = typingNow || (last ? (conv.kind === 'group' && last.author !== engine.identity.fp ? engine.displayName(last.author) + ': ' : (last.author === engine.identity.fp ? 'You: ' : '')) + last.text : (conv.kind === 'group' ? 'Group created' : 'No messages yet'));
+    const preview = typingNow || (last ? (conv.kind === 'group' && last.author !== engine.identity.fp ? engine.displayName(last.author) + ': ' : (last.author === engine.identity.fp ? 'You: ' : '')) + filePreview(last) : (conv.kind === 'group' ? 'Group created' : 'No messages yet'));
     return h('li', { class: conv.id === currentConv ? 'active' : '', onclick: () => openConv(conv.id), dataset: { conv: conv.id } },
       avatar(other || conv.id.slice(2), title, online),
       h('div', { class: 'info' },
@@ -776,6 +926,7 @@ function renderChat() {
       if (selectedMsg) e.currentTarget.classList.add('sel');
     } },
       first && !mine && conv.kind === 'group' ? h('div', { class: 'who', text: engine.displayName(m.author) }) : null,
+      m.file ? attachmentNode(m) : null,
       m.deleted ? 'Message deleted' : m.text,
       h('span', { class: 'meta' }, fmtTime(m.ts), mine && !m.deleted ? tickFor(convId, m) : null),
       h('button', { class: 'more', title: 'Message options', 'aria-label': 'Message options', text: '⋯', onclick: () => showMessage(convId, m) })));
@@ -854,7 +1005,8 @@ async function notify(conv, env, body) {
   const c = engine.convs.get(conv);
   const title = c.kind === 'group' ? `${engine.convTitle(c)} · ${engine.displayName(env.author)}` : engine.displayName(env.author);
   const reg = await navigator.serviceWorker?.getRegistration();
-  const opts = { body: body.text.slice(0, 140), tag: conv, data: { conv }, icon: 'icons/icon-192.png' };
+  const text = body.file ? (inlineKind(String(body.file.mime)) === 'image' ? '📷 Photo' : '📎 File') + (body.text ? ': ' + body.text : '') : body.text;
+  const opts = { body: text.slice(0, 140), tag: conv, data: { conv }, icon: 'icons/icon-192.png' };
   if (reg) reg.showNotification(title, opts); else new Notification(title, opts);
 }
 
@@ -906,6 +1058,21 @@ function wireMain() {
     renderChat.forceScroll = true;
     await engine.sendText(currentConv, text);
   });
+  $('btnAttach').onclick = () => $('fileInput').click();
+  $('fileInput').addEventListener('change', (e) => { sendFiles([...e.target.files]); e.target.value = ''; });
+  input.addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData?.files || [])];
+    if (files.length) { e.preventDefault(); sendFiles(files); }
+  });
+  const chat = $('chat');
+  chat.addEventListener('dragover', (e) => { if (currentConv && e.dataTransfer?.types.includes('Files')) { e.preventDefault(); chat.classList.add('drop'); } });
+  chat.addEventListener('dragleave', (e) => { if (!chat.contains(e.relatedTarget)) chat.classList.remove('drop'); });
+  chat.addEventListener('drop', (e) => {
+    chat.classList.remove('drop');
+    if (!currentConv || !e.dataTransfer?.files.length) return;
+    e.preventDefault();
+    sendFiles([...e.dataTransfer.files]);
+  });
   $('dialog').addEventListener('click', (e) => { if (e.target === $('dialog')) closeDialog(); });
   addEventListener('online', scheduleRender);
   addEventListener('offline', scheduleRender);
@@ -954,6 +1121,13 @@ async function startApp() {
     if (!e.detail.local) notify(e.detail.conv, e.detail.env, e.detail.body);
   });
   net.addEventListener('typing', (e) => onTyping(e.detail));
+  // Download progress: refresh just that attachment (a full render on every chunk would be wasteful).
+  net.files.addEventListener('progress', (e) => {
+    const n = fileNodes.get(e.detail.id);
+    const ref = engine.fileRef(e.detail.id);
+    if (n && ref && n.el.isConnected) attachmentNode(ref.msg);
+  });
+  engine.addEventListener('file', scheduleRender);
   engine.addEventListener('change', (e) => {
     scheduleRender();
     if (e.detail.what === 'requests' && e.detail.fp) toast(`${engine.displayName(e.detail.fp)} wants to connect`, { label: 'View', run: () => document.querySelector('[data-tab=contacts]').click() });

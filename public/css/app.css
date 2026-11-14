@@ -125,6 +125,22 @@ mark { background: color-mix(in srgb, var(--warn) 45%, transparent); color: inhe
 .sysmsg { align-self: center; font-size: .8em; color: var(--muted); margin: .6em 0; text-align: center; max-width: 80%; }
 #composer { display: flex; gap: .5em; padding: .6em; border-top: 1px solid var(--line); background: var(--panel); padding-bottom: max(.6em, env(safe-area-inset-bottom)); }
 #composer textarea { resize: none; max-height: 30vh; }
+#composer .attach { flex: none; align-self: flex-end; height: 40px; }
+#chat.drop { outline: 3px dashed var(--accent); outline-offset: -6px; }
+.att { margin: -.2em -.45em .25em; }
+.att:empty { display: none; }
+.att-img { display: block; max-width: min(100%, 360px); max-height: 360px; border-radius: 10px; cursor: zoom-in; background: rgb(0 0 0 / .15); object-fit: cover; }
+video.att-img { cursor: default; }
+.att-img.blur { filter: blur(8px); transform: scale(.98); cursor: default; }
+.att audio { width: min(300px, 70vw); display: block; }
+.att-file { display: flex; align-items: center; gap: .6em; padding: .45em .6em; background: rgb(0 0 0 / .12); border-radius: 10px; min-width: 200px; white-space: normal; }
+.att-file.small { margin-top: .3em; padding: .3em .5em; }
+.att-icon { font-size: 1.5em; }
+.att-name { font-weight: 600; overflow-wrap: anywhere; }
+.att-meta { font-size: .78em; opacity: .75; }
+.att-save { padding: .3em .7em; font-size: .85em; }
+.msg.mine .att-save { background: rgb(255 255 255 / .15); color: #fff; border-color: rgb(255 255 255 / .3); }
+img.viewer { display: block; max-width: 100%; max-height: 70dvh; margin: 0 auto; border-radius: 8px; }
 
 dialog { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); color: var(--text); padding: 0; width: min(520px, calc(100vw - 1.5em)); max-height: calc(100dvh - 2em); }
 dialog::backdrop { background: rgb(0 0 0 / .55); }

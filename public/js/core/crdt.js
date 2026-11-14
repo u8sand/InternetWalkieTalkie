@@ -30,6 +30,8 @@
 // that keeps its place in the version vector (so peers don't resend it) but holds no
 // ciphertext and is never sent on.
 
+import { cleanFileMeta } from './files.js';
+
 export const PINNED_TYPES = new Set(['group', 'rename']);
 
 const cmp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
@@ -183,9 +185,12 @@ export class ConversationView {
     switch (body.type) {
       case 'msg': {
         if (typeof body.text !== 'string') return;
+        const file = body.file ? cleanFileMeta(body.file) : null;
+        if (body.file && !file) return;
+        const deleted = this.tombstones.has(id);
         this.messages.set(id, {
           id, author: env.author, dev: env.dev, seq: env.seq, lamport: env.lamport, ts,
-          text: body.text.slice(0, 20000), deleted: this.tombstones.has(id),
+          text: deleted ? '' : body.text.slice(0, 20000), file: deleted ? null : file, deleted,
         });
         this._sorted = null;
         break;
@@ -195,7 +200,7 @@ export class ConversationView {
         if (typeof body.target !== 'string' || !body.target.startsWith(env.author + ':')) return;
         this.tombstones.add(body.target);
         const m = this.messages.get(body.target);
-        if (m) { m.deleted = true; m.text = ''; }
+        if (m) { m.deleted = true; m.text = ''; m.file = null; }
         break;
       }
       case 'group':
