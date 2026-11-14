@@ -689,7 +689,7 @@ function showSettings() {
 
     h('div', { class: 'section' },
       h('h3', { text: 'Backup' }),
-      h('p', { class: 'muted small', text: 'Your messages are only on your devices: there\'s no cloud copy. If you lose this device, they\'re gone unless you linked another device or saved a backup. A backup is a file locked with a passphrase you choose. Photos and files aren\'t included (a restored device fetches them from the people you talk to).' }),
+      h('p', { class: 'muted small', text: 'Your messages are only on your devices: there\'s no cloud copy. If you lose this device, they\'re gone unless you linked another device or saved a backup. A backup is a file locked with a passphrase you choose. It holds your identity, contacts, messages and settings, including your relay and its access code. Photos and files aren\'t included (a restored device fetches them from the people you talk to).' }),
       pass,
       h('div', { class: 'row end', style: 'margin-top:.5em' },
         h('button', { text: 'Export backup', onclick: async () => {
@@ -787,7 +787,7 @@ function showRelaySetup() {
       p('Sign up or log in at Cloudflare (free), open Realtime → TURN Server, and click Create. Keep the Token ID and API token it shows for the next step.'),
       link('Open the Cloudflare dashboard', 'https://dash.cloudflare.com/')),
     step('2', 'Create the relay',
-      p('This opens Cloudflare\'s setup page for the relay. Sign up or log in, then follow its steps. It asks for TURN_KEY_ID and TURN_KEY_API_TOKEN (from step 1, or leave empty) and an ACCESS_CODE: any password you choose, which people need before your relay carries their connections. When it\'s done it shows your relay\'s address.'),
+      p('This opens Cloudflare\'s setup page for the relay. Sign up or log in, then follow its steps. Cloudflare keeps the relay\'s code in a GitHub (or GitLab) account of yours, so you\'ll need one, and it asks you to connect it. Where GitHub asks which repositories to allow, "Only select repositories" is enough. It asks for TURN_KEY_ID and TURN_KEY_API_TOKEN (from step 1, or leave empty) and an ACCESS_CODE: any password you choose, which people need before your relay carries their connections. When it\'s done it shows your relay\'s address.'),
       link('Create my relay on Cloudflare', RELAY_DEPLOY_URL)),
     step('3', 'Paste the address here',
       h('label', {}, 'Relay address', addr),

@@ -15,7 +15,10 @@ IP addresses, and so does Cloudflare.
 
 ## Deploy
 
-1. Click **Deploy to Cloudflare** above and sign in (a free account is enough).
+1. Click **Deploy to Cloudflare** above and sign in (a free account is enough). Cloudflare keeps
+   a copy of the relay's code in a GitHub or GitLab account of yours, so you need one of those
+   too, and it asks you to connect it. When GitHub asks which repositories Cloudflare may
+   access, "Only select repositories" is enough.
 2. It asks for three optional values. You can leave them all empty and add them later:
    - `TURN_KEY_ID` and `TURN_KEY_API_TOKEN`: only needed for carrying connections. In the
      Cloudflare dashboard, open **Realtime → TURN Server → Create**; it shows a Token ID and an
@@ -52,6 +55,21 @@ walkie-talkie-relay → Settings → Variables and Secrets**) or with
 - It doesn't check events' Nostr signatures (Workers have no secp256k1). The app doesn't rely on
   them: they come from throwaway keys, and every payload is signed again inside its encryption.
 - TURN comes from Cloudflare instead of a coturn server you run.
+
+## Without a GitHub account
+
+The button needs GitHub or GitLab. Without one, deploy from your own computer with Node.js
+installed. Download this repository (on GitHub: **Code → Download ZIP**), then in the `worker`
+folder:
+
+```bash
+npm install
+npx wrangler login     # opens Cloudflare in your browser
+npx wrangler deploy    # prints your relay's address
+npx wrangler secret put TURN_KEY_ID          # optional, for carrying connections
+npx wrangler secret put TURN_KEY_API_TOKEN
+npx wrangler secret put ACCESS_CODE
+```
 
 ## Develop
 

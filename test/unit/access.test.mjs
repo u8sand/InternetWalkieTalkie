@@ -198,3 +198,19 @@ test('storage budget counts only what is still held: expired messages free it', 
   assert.equal(after.ops, 1, 'only the watermark remains');
   assert.ok(after.bytes < before.bytes);
 });
+
+test('a backup carries the relay, TURN and network settings', async () => {
+  const a = await user('A');
+  await a.saveSettings({ myRelay: 'wss://r.example.workers.dev', relayCode: 'pw', iceServers: ['turn:t.example:3478 u p'], directConnections: false });
+  a.turnServers = ['turn:fetched:3478 short lived']; // fetched credentials are never stored
+  const file = await a.exportBackup('correct horse battery');
+  const b = new Engine(new MemoryStore());
+  await b.importBackup(file, 'correct horse battery');
+  await b.load();
+  assert.equal(b.identity.fp, a.identity.fp);
+  assert.equal(b.settings.myRelay, 'wss://r.example.workers.dev');
+  assert.equal(b.settings.relayCode, 'pw');
+  assert.deepEqual(b.settings.iceServers, ['turn:t.example:3478 u p']);
+  assert.equal(b.settings.directConnections, false);
+  assert.deepEqual(b.iceServers(), ['turn:t.example:3478 u p'], 'fresh TURN credentials are fetched again from the relay');
+});
