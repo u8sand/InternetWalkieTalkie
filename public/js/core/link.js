@@ -98,7 +98,7 @@ function connectHelp(pc) {
   else if (!mine.has('srflx') || !theirs.has('srflx')) why = 'At least one device could not find its public address, so they can only meet on the same local network. Put both on the same Wi-Fi (not a guest network), or check the STUN servers in Settings.';
   else if ([...publicIps(pc.localDescription?.sdp)].some((ip) => publicIps(pc.remoteDescription?.sdp).has(ip))) {
     // Same public address = same router, yet they couldn't reach each other inside the network.
-    why = 'Both devices are on the same network but could not find each other on it. Browsers hide local addresses behind names that some firewalls, VPNs and routers don\'t pass along. Turn off any VPN, and allow this site to use the camera on both devices (for example by using "Scan QR" here once): with that permission the browser shares the real local address. Then try again.';
+    why = 'Both devices are on the same network but could not find each other on it (a VPN, a firewall on either device, or the router can prevent that). Turn off any VPN and try again, or add a TURN server in Settings.';
   } else why = 'The networks between them block direct connections. This is common on mobile data and on guest or office Wi-Fi. Put both devices on the same home Wi-Fi and try again, or add a TURN server in Settings.';
   return `${why} You can also move your identity with an encrypted backup file (Settings → Backup), which needs no connection. [this device: ${show(mine)}; other device: ${show(theirs)}]`;
 }
