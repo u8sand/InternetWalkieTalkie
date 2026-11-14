@@ -9,12 +9,15 @@ import { Peer } from './peer.js';
 import { RelayPool, inboxTopic, utcDay, postMail, MAIL_KIND, MAIL_TTL_S } from './signaling.js';
 import { sealSignal, openSignal } from './crypto.js';
 import { pack, unpack } from './encoding.js';
+import { opKey } from './engine.js';
 
 const HELLO_EVERY_MS = 20000;
 const debug = (...a) => { if (globalThis.IWT_DEBUG) console.log('[net]', ...a); };
 const MAX_SKEW_MS = 120000;
 const MAIL_RETRY_MS = 60000;
 const MAIL_BATCH_BYTES = 32 * 1024;
+const RCPT_DELAY_MS = 400;     // coalesce receipts for a burst of incoming ops
+const RCPT_MAIL_EVERY_MS = 60000;
 
 export class Network extends EventTarget {
   constructor(engine) {
@@ -27,12 +30,20 @@ export class Network extends EventTarget {
     this.nonces = new Set();
     this.mailing = new Set();     // fps with a mail flush in flight
     this.lastMailTry = new Map();
+    this.rcptLive = new Set();    // convs whose receipt should go to connected members soon
+    this.rcptMail = new Map();    // fp -> Set<conv>: receipts to mail to members who are offline
+    this.lastRcptMail = new Map();
     this.pool = new RelayPool();
     this.pool.addEventListener('event', (e) => this._onRelayEvent(e.detail));
     this.pool.addEventListener('status', (e) => this._emit('relays', e.detail));
     this.pool.addEventListener('relayopen', () => this._presence(true));
-    engine.addEventListener('op', (e) => { this._fanout(e.detail); if (e.detail.local) this._mailOffline(e.detail); });
+    engine.addEventListener('op', (e) => {
+      this._fanout(e.detail);
+      if (e.detail.local) this._mailOffline(e.detail);
+      else this._receivedOp(e.detail);
+    });
     engine.addEventListener('change', (e) => {
+      if (e.detail.what === 'read') this._readChanged(e.detail);
       if (e.detail.what === 'contacts') { this._refreshTopics(); this._presence(true); }
       // Just added someone from their link: if they're offline but have a mailbox,
       // leave the introduction there so they can accept us without being online together.
@@ -52,7 +63,10 @@ export class Network extends EventTarget {
   start() {
     this._setRelays();
     this._refreshTopics();
-    this.timer = setInterval(() => { this._refreshTopics(); this._presence(); this._flushAllMail(); }, HELLO_EVERY_MS / 2);
+    this.timer = setInterval(() => {
+      this._refreshTopics(); this._presence(); this._flushAllMail(); this._flushReceiptMail();
+      for (const p of this.peers.values()) if (!p.ownDevice) this.engine.noteSeen(p.fp).catch(() => {});
+    }, HELLO_EVERY_MS / 2);
     globalThis.addEventListener?.('online', () => { this._presence(true); this._flushAllMail(true); });
     this.processInbox();
   }
@@ -258,7 +272,8 @@ export class Network extends EventTarget {
         const acked = await postMail(urls, await inboxTopic(fp), blob);
         debug('mailed', batch.length, 'ops to', fp.slice(0, 8), 'acked by', acked);
         if (!acked) break; // their relay is unreachable: retry later
-        await this.engine.clearMail(fp, batch.map((e) => e.conv + '|' + e.author + '|' + e.seq));
+        await this.engine.clearMail(fp, batch.map(opKey));
+        await this.engine.noteRelayed(fp, batch);
       }
     } catch (e) { debug('mail failed', e); }
     finally { this.mailing.delete(fp); }
@@ -280,6 +295,14 @@ export class Network extends EventTarget {
   async _onMail(ev) {
     let payload, sender;
     try { ({ payload, sender } = await openSignal(this.engine.identity, ev.content)); } catch { return; }
+    if (payload.type === 'rcpt' && payload.convs && typeof payload.convs === 'object') {
+      if (Date.now() - payload.ts > (MAIL_TTL_S + 86400) * 1000) return;
+      for (const [id, r] of Object.entries(payload.convs).slice(0, 256)) {
+        if (r && typeof r === 'object') await this.engine.noteReceipt(id, sender.fp, { got: r.got, read: r.read });
+      }
+      if (Number.isSafeInteger(ev.created_at)) await this.engine.setMailSince(ev.created_at);
+      return;
+    }
     if (payload.type !== 'mail' || !Array.isArray(payload.ops)) return;
     if (Date.now() - payload.ts > (MAIL_TTL_S + 86400) * 1000) return;
     // Strangers can't mail us, unless they present our link's invite token.
@@ -322,13 +345,24 @@ export class Network extends EventTarget {
       this.peers.set(peer.ek, peer);
       if (old && old !== peer) old.close();
       peer.sendSync();
+      // Catch them up on group receipts (direct chats are covered by the sync itself).
+      peer.sendReceipts(this.engine.sharedConvs(fp).filter((id) => this.engine.convs.get(id).kind === 'group'), { relayed: true }).catch(() => {});
       this._emit('peers', { fp, online: true, own: peer.ownDevice });
     });
     peer.addEventListener('synced', (e) => this._emit('synced', { fp: peer.fp, ...e.detail }));
+    peer.addEventListener('typing', (e) => this._emit('typing', e.detail));
+    // Pass group members' receipts on to members who may not be connected to them.
+    peer.addEventListener('receipts', (e) => {
+      for (const other of this.peers.values()) {
+        if (other === peer) continue;
+        other.sendSigned(e.detail.filter((r) => r.fp !== other.fp && this.engine.convs.get(r.conv)?.kind === 'group' && this.engine.convs.get(r.conv).members.includes(other.fp)));
+      }
+    });
     peer.addEventListener('close', () => {
       this.pending.delete(peer.sid);
       if (peer.remote && this.peers.get(peer.ek) === peer) {
         this.peers.delete(peer.ek);
+        if (!peer.ownDevice) this.engine.noteSeen(peer.remote.fp, { flush: true }).catch(() => {});
         this._emit('peers', { fp: peer.remote.fp, online: this.isOnline(peer.remote.fp), own: peer.ownDevice });
         this.lastHello.delete(peer.remote.fp);
         setTimeout(() => this._presence(true), 1000);
@@ -348,6 +382,71 @@ export class Network extends EventTarget {
       if (peer.ek === source || !c.members.includes(peer.fp)) continue;
       peer.sendOps([env]);
     }
+  }
+
+  // ------------------------------------------------------------ receipts & typing
+
+  /** We stored someone's op: tell connected members, and mail the author if they're away. */
+  _receivedOp({ env, conv }) {
+    this._queueLiveReceipt(conv);
+    if (env.author !== this.engine.identity.fp && !this.isOnline(env.author)) this._queueReceiptMail(env.author, conv);
+  }
+
+  /** We read further: anyone whose messages we just read and who is away gets a mailed receipt. */
+  _readChanged({ conv, from, to }) {
+    this._queueLiveReceipt(conv);
+    if (this.engine.settings.receipts === false) return;
+    const me = this.engine.identity.fp;
+    for (const m of this.engine.views.get(conv)?.list() || []) {
+      if (m.lamport > from && m.lamport <= to && m.author !== me && !this.isOnline(m.author)) this._queueReceiptMail(m.author, conv);
+    }
+  }
+
+  _queueLiveReceipt(conv) {
+    this.rcptLive.add(conv);
+    if (this.rcptTimer) return;
+    this.rcptTimer = setTimeout(() => {
+      this.rcptTimer = null;
+      const convs = [...this.rcptLive];
+      this.rcptLive.clear();
+      for (const peer of this.peers.values()) {
+        const mine = convs.filter((id) => this.engine.convs.get(id)?.members.includes(peer.fp));
+        if (mine.length) peer.sendReceipts(mine).catch(() => {});
+      }
+    }, RCPT_DELAY_MS);
+  }
+
+  _queueReceiptMail(fp, conv) {
+    if (!this.engine.mailboxes.get(fp)?.length) return;
+    let set = this.rcptMail.get(fp);
+    if (!set) { set = new Set(); this.rcptMail.set(fp, set); }
+    set.add(conv);
+  }
+
+  /** At most one receipt mail per contact per minute, covering every conversation that changed. */
+  async _flushReceiptMail() {
+    for (const [fp, convs] of [...this.rcptMail]) {
+      if (this.isOnline(fp)) { this.rcptMail.delete(fp); continue; } // live sync covers it
+      if (Date.now() - (this.lastRcptMail.get(fp) || 0) < RCPT_MAIL_EVERY_MS) continue;
+      const urls = this.engine.mailboxes.get(fp) || [];
+      const k = this.engine.keyring.get(fp);
+      if (!urls.length || !k) { this.rcptMail.delete(fp); continue; }
+      this.lastRcptMail.set(fp, Date.now());
+      const payload = {};
+      for (const id of convs) payload[id] = this.engine.myReceipt(id);
+      try {
+        const blob = await sealSignal(this.engine.identity, k, { type: 'rcpt', convs: payload });
+        if (await postMail(urls, await inboxTopic(fp), blob)) this.rcptMail.delete(fp);
+      } catch (e) { debug('receipt mail failed', e); }
+    }
+  }
+
+  /** Tell everyone connected in a conversation that we started or stopped typing. */
+  sendTyping(conv, on) {
+    if (this.engine.settings.receipts === false) return;
+    const c = this.engine.convs.get(conv);
+    if (!c) return;
+    for (const peer of this.peers.values()) if (c.members.includes(peer.fp)) peer.sendTyping(conv, on);
   }
 
   // ------------------------------------------------------------ manual connection codes

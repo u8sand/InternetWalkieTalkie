@@ -10,6 +10,11 @@
 // Sync: {t:'sync', convs:{id: versionVector}} → each side answers with the ops
 // the other is missing ({t:'ops', ops:[…]}). New local or relayed ops are pushed
 // live to every connected member of the conversation (store-and-forward gossip).
+//
+// Receipts: the version vectors in 'sync' already show which ops the peer holds
+// (delivered). {t:'rcpt', list:[{conv, fp, got, read, sig}]} reports changes promptly;
+// 'read' is the Lamport mark of what fp has seen. Receipts are signed by fp, so in groups
+// members pass on each other's. {t:'typing', conv, on} is ephemeral.
 
 import { sign, verify, importCard, authTranscript } from './crypto.js';
 import { b64u, fromB64u, randomBytes } from './encoding.js';
@@ -191,6 +196,30 @@ export class Peer extends EventTarget {
         batch.push(...this.engine.missingFor(id, vv && typeof vv === 'object' ? vv : {}));
       }
       await this.sendOps(batch);
+      if (!this.ownDevice) {
+        const rd = msg.rd && typeof msg.rd === 'object' ? msg.rd : {};
+        for (const id of shared) {
+          const vv = msg.convs[id];
+          if (vv && typeof vv === 'object') await this.engine.noteReceipt(id, this.remote.fp, { got: vv, read: rd[id] });
+        }
+      }
+      return;
+    }
+
+    if (msg.t === 'rcpt' && Array.isArray(msg.list)) {
+      const shared = new Set(this.engine.sharedConvs(this.remote.fp));
+      const fresh = [];
+      for (const r of msg.list.slice(0, 512)) {
+        if (shared.has(r?.conv) && (await this.engine.ingestSignedReceipt(r))) fresh.push(r);
+      }
+      if (fresh.length) this.dispatchEvent(new CustomEvent('receipts', { detail: fresh }));
+      return;
+    }
+
+    if (msg.t === 'typing' && !this.ownDevice && typeof msg.conv === 'string') {
+      if (this.engine.convs.get(msg.conv)?.members.includes(this.remote.fp)) {
+        this.dispatchEvent(new CustomEvent('typing', { detail: { fp: this.remote.fp, conv: msg.conv, on: !!msg.on } }));
+      }
       return;
     }
 
@@ -211,9 +240,35 @@ export class Peer extends EventTarget {
   sendSync() {
     if (!this.authed) return;
     if (this.ownDevice) this._send({ t: 'mine', summary: this.engine.ownDeviceSummary() });
-    const convs = {};
-    for (const id of this.engine.sharedConvs(this.remote.fp)) convs[id] = this.engine.vv(id);
-    this._send({ t: 'sync', convs });
+    const convs = {}, rd = {};
+    for (const id of this.engine.sharedConvs(this.remote.fp)) {
+      const r = this.engine.myReceipt(id);
+      convs[id] = r.got;
+      if (r.read) rd[id] = r.read;
+    }
+    this._send({ t: 'sync', convs, ...(this.ownDevice ? {} : { rd }) });
+  }
+
+  /**
+   * Tell the peer what we now hold and have read in these conversations, plus (in groups)
+   * other members' receipts we can pass on.
+   */
+  async sendReceipts(convIds, { relayed = false } = {}) {
+    if (!this.authed || this.ownDevice || !convIds.length) return;
+    const list = [];
+    for (const id of convIds) {
+      list.push(await this.engine.signedReceipt(id));
+      if (relayed) for (const r of this.engine.relayReceipts(id)) if (r.fp !== this.remote.fp) list.push(r);
+    }
+    this.sendSigned(list);
+  }
+
+  sendSigned(list) {
+    if (this.authed && !this.ownDevice && list.length) this._send({ t: 'rcpt', list });
+  }
+
+  sendTyping(conv, on) {
+    if (this.authed && !this.ownDevice) this._send({ t: 'typing', conv, on });
   }
 
   async sendOps(ops) {

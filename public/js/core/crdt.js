@@ -24,6 +24,11 @@
 // expired history. A replica that was away longer than the retention period just
 // receives the watermark and moves its floor up. State ops (group creation, renames)
 // are pinned: they never expire, so membership and names survive.
+//
+// Local deletion ("delete for me", clearing a chat) is not a CRDT operation: it changes
+// only this user's replicas. A deleted message's op is replaced by a header-only *stub*
+// that keeps its place in the version vector (so peers don't resend it) but holds no
+// ciphertext and is never sent on.
 
 export const PINNED_TYPES = new Set(['group', 'rename']);
 
@@ -120,14 +125,24 @@ export class OpLog {
     return out;
   }
 
-  /** Ops the holder of `remoteVV` is missing, in causal-friendly order. */
-  since(remoteVV = {}) {
+  /**
+   * Ops the holder of `remoteVV` is missing, in causal-friendly order. Stubs (ops this
+   * replica deleted locally, keeping only the header) are never sent to peers; they are
+   * included only when copying state to our own new device.
+   */
+  since(remoteVV = {}, includeStubs = false) {
     const out = [];
     for (const [st, m] of this.byAuthor) {
       const have = Number.isSafeInteger(remoteVV[st]) ? remoteVV[st] : 0;
-      for (const [seq, env] of m) if (seq > have) out.push(env);
+      for (const [seq, env] of m) if (seq > have && (includeStubs || !env.stub)) out.push(env);
     }
     return out.sort(compareOps);
+  }
+
+  /** Swap a held op for its header-only stub (same stream and seq, so the version vector is unchanged). */
+  replace(stub) {
+    const m = this.byAuthor.get(streamOf(stub));
+    if (m?.has(stub.seq)) m.set(stub.seq, stub);
   }
 
   get size() {
@@ -155,6 +170,11 @@ export class ConversationView {
       this.tombstones.delete(id);
     }
     this._sorted = null;
+  }
+
+  /** Drop a message from this replica's view only ("delete for me"). */
+  hide(id) {
+    if (this.messages.delete(id)) this._sorted = null;
   }
 
   apply(env, body) {

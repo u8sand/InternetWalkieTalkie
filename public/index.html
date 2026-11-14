@@ -63,7 +63,9 @@
         <button role="tab" data-tab="chats" class="active">Chats</button>
         <button role="tab" data-tab="contacts">Contacts <span id="reqBadge" class="badge" hidden></span></button>
       </nav>
+      <div id="searchBar"><input id="search" type="search" placeholder="Search messages" aria-label="Search messages" autocomplete="off"></div>
       <ul id="convList" class="list"></ul>
+      <ul id="searchResults" class="list" hidden></ul>
       <ul id="contactList" class="list" hidden></ul>
       <div id="offlineNote" class="note" hidden>You're offline. Running from this device's cache — messages you write are saved and will sync later.</div>
     </aside>

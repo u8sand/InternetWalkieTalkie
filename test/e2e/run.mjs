@@ -122,7 +122,32 @@ try {
   await expectMsg(alice, 'Hi Alice, it is Bob');
   await send(alice, 'Hey Bob! Encrypted and serverless.');
   await expectMsg(bob, 'Hey Bob! Encrypted and serverless.');
+
+  step('read receipts: Bob has the chat open, so Alice sees two ticks');
+  await alice.page.waitForSelector('.msg.mine:has-text("Hey Bob!") .tick.read', { timeout: 15000 });
+  await bob.page.waitForSelector('.msg.mine:has-text("Hi Alice") .tick.read', { timeout: 15000 });
+
+  step('typing indicator');
+  await alice.page.fill('#composerInput', 'typing something');
+  await bob.page.waitForSelector('#chatSub.typing:has-text("typing…")', { timeout: 10000 });
+  await alice.page.fill('#composerInput', '');
+  await bob.page.waitForSelector('#chatSub:not(.typing)', { timeout: 10000 });
   await shot(alice, '2-chat');
+
+  step('search jumps to the message');
+  await bob.page.fill('#search', 'SERVERLESS');
+  await bob.page.click('#searchResults li:has(mark:text-is("serverless"))');
+  await bob.page.waitForSelector('.msg.flash:has-text("Encrypted and serverless")');
+  await bob.page.fill('#search', '');
+
+  step("delete for me: Bob removes Alice's message from his view only");
+  await send(alice, 'Bob will delete this one');
+  await expectMsg(bob, 'Bob will delete this one');
+  await bob.page.click('.msg:has-text("Bob will delete this one")');
+  await bob.page.click('.msg.sel .more');
+  await bob.page.click('dialog button:has-text("Delete for me")');
+  await bob.page.waitForSelector('.msg:has-text("Bob will delete this one")', { state: 'detached' });
+  assert.ok(await alice.page.isVisible('.msg:has-text("Bob will delete this one")'), "Alice's copy stays");
 
   step('Bob goes offline; Alice keeps writing; Bob catches up on return');
   await bob.page.close();
@@ -133,6 +158,7 @@ try {
   await bob.page.waitForSelector('#main:not([hidden])');
   await openChatWith(bob, 'Alice');
   await expectMsg(bob, 'Written while you were offline', 40000);
+  assert.equal(await bob.page.locator('.msg:has-text("Bob will delete this one")').count(), 0, 'deleted message did not sync back');
 
   step("never online together: Alice's message waits on Bob's own mailbox relay");
   await bob.page.close();
@@ -141,6 +167,7 @@ try {
   let before = mailed();
   await send(alice, 'Left in your mailbox');
   await until(() => mailed() > before, 20000, 'mail on Bob\'s relay');
+  await alice.page.waitForSelector('.msg.mine:has-text("Left in your mailbox") .tick[title="Delivered to their mailbox"]', { timeout: 10000 });
   await alice.page.close();                     // Alice is gone before Bob returns
   await reopen(bob);
   await openChatWith(bob, 'Alice');
@@ -224,6 +251,9 @@ try {
   await expectMsg(bob, 'Carol here, via Alice');
   await send(bob, 'Bob says hi to the group');
   await expectMsg(carol, 'Bob says hi to the group');
+  // Carol (never connected to Bob) has the group open: her signed read receipt reaches Bob via Alice.
+  await bob.page.waitForSelector('.msg.mine:has-text("Bob says hi to the group") .tick.read', { timeout: 15000 });
+  assert.ok(!(await bob.page.evaluate((f) => window.__iwt.net.isOnline(f), carolFp)), 'Bob and Carol are not connected');
   await shot(bob, '4-group');
 
   step("Bob links his phone by opening the QR link; it gets his identity and full history");

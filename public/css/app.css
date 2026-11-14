@@ -104,10 +104,23 @@ button.back { display: none; }
 .msg.mine { background: var(--mine); color: #fff; align-self: flex-end; }
 .msg.first { margin-top: .6em; }
 .msg .who { font-size: .78em; font-weight: 600; color: var(--accent); margin-bottom: .1em; }
-.msg .meta { font-size: .7em; opacity: .65; margin-left: .8em; float: right; margin-top: .35em; user-select: none; }
+.msg .meta { font-size: .7em; color: color-mix(in srgb, currentColor 65%, transparent); margin-left: .8em; float: right; margin-top: .35em; user-select: none; }
 .msg.deleted { font-style: italic; opacity: .6; }
-.msg .del { position: absolute; top: -8px; left: -8px; width: 22px; height: 22px; padding: 0; border-radius: 50%; font-size: 12px; display: none; line-height: 1; }
-.msg.mine:hover .del { display: grid; place-items: center; }
+.msg .more { position: absolute; top: -9px; right: -9px; width: 24px; height: 24px; padding: 0; border-radius: 50%; font-size: 14px; display: none; line-height: 1; color: var(--text); }
+.msg.mine .more { right: auto; left: -9px; }
+.msg:hover .more, .msg.sel .more { display: grid; place-items: center; }
+.msg.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+.msg.flash { animation: flash 2s ease-out; }
+@keyframes flash { 0%, 40% { box-shadow: 0 0 0 3px var(--warn); } 100% { box-shadow: 0 0 0 3px transparent; } }
+.msg .tick { margin-left: .35em; font-size: 1.3em; line-height: 1; letter-spacing: -.3em; padding-right: .3em; vertical-align: -.05em; }
+.msg .tick.read { color: #a5f3fc; font-weight: 700; }
+.typing, .chat-title span.typing { color: var(--accent); font-style: italic; }
+.typing-row { align-self: flex-start; font-size: .8em; color: var(--muted); font-style: italic; margin: .4em .2em; }
+#searchBar { padding: .5em .8em; border-bottom: 1px solid var(--line); }
+#searchBar input { padding: .4em .7em; }
+mark { background: color-mix(in srgb, var(--warn) 45%, transparent); color: inherit; border-radius: 2px; }
+.quote { background: var(--panel-2); border-left: 3px solid var(--accent); padding: .5em .8em; border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 30vh; overflow-y: auto; }
+.list.receipts { max-height: 40vh; border: 1px solid var(--line); border-radius: 8px; }
 .day { align-self: center; font-size: .75em; color: var(--muted); margin: 1em 0 .4em; }
 .sysmsg { align-self: center; font-size: .8em; color: var(--muted); margin: .6em 0; text-align: center; max-width: 80%; }
 #composer { display: flex; gap: .5em; padding: .6em; border-top: 1px solid var(--line); background: var(--panel); padding-bottom: max(.6em, env(safe-area-inset-bottom)); }

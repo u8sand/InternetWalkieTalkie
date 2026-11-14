@@ -1,6 +1,6 @@
 // UI. All user-controlled strings are rendered with textContent — never innerHTML.
 
-import { Engine, RETENTION_CHOICES, DEFAULT_RETENTION_DAYS } from './core/engine.js';
+import { Engine, RETENTION_CHOICES, DEFAULT_RETENTION_DAYS, directConvId } from './core/engine.js';
 import { IDBStore } from './core/store.js';
 import { Network } from './core/net.js';
 import { LinkHost, LinkJoin, LINK_TTL_MS } from './core/link.js';
@@ -29,6 +29,9 @@ function h(tag, attrs = {}, ...children) {
 let engine, net;
 let currentConv = null;
 let currentTab = 'chats';
+let selectedMsg = null;       // message whose actions are showing (tap to select on touch screens)
+let searchQuery = '';
+const typing = new Map();     // conv -> Map<fp, expiry ms>: who is typing there right now
 
 // ------------------------------------------------------------------ helpers
 
@@ -62,6 +65,50 @@ function fmtRetention(days) {
 function fmtTime(ts) {
   const d = new Date(ts);
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtAgo(ts) {
+  const s = Math.max(0, (Date.now() - ts) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  const day = fmtDay(ts);
+  return day === 'Today' ? 'today at ' + fmtTime(ts) : day === 'Yesterday' ? 'yesterday at ' + fmtTime(ts) : 'on ' + day;
+}
+
+function typingIn(convId) {
+  const m = typing.get(convId);
+  if (!m) return [];
+  const now = Date.now();
+  for (const [fp, until] of m) if (until < now) m.delete(fp);
+  return [...m.keys()];
+}
+
+function typingText(convId, group) {
+  const who = typingIn(convId);
+  if (!who.length) return '';
+  if (!group) return 'typing…';
+  const names = who.map((fp) => engine.displayName(fp));
+  return (names.length > 2 ? `${names.length} people are` : names.join(' and ') + (names.length === 1 ? ' is' : ' are')) + ' typing…';
+}
+
+const TICKS = {
+  read: { text: '✓✓', cls: 'tick read', label: 'Read' },
+  got: { text: '✓', cls: 'tick', label: 'Delivered to their device' },
+  relay: { text: '✓', cls: 'tick', label: 'Delivered to their mailbox' },
+  null: { text: '◷', cls: 'tick', label: 'Not delivered yet (stored on your devices)' },
+};
+
+function tickFor(convId, m) {
+  const conv = engine.convs.get(convId);
+  const r = engine.receiptState(convId, m);
+  const t = TICKS[r.state];
+  let title = t.label;
+  if (conv.kind === 'group') {
+    const by = (s) => Object.entries(r.members).filter(([, v]) => v === s).map(([fp]) => engine.displayName(fp));
+    title = [['Read by', by('read')], ['Delivered to', [...by('got'), ...by('relay')]], ['Waiting for', by(null)]]
+      .filter(([, l]) => l.length).map(([k, l]) => `${k} ${l.join(', ')}`).join('\n');
+  }
+  return h('span', { class: t.cls, title, 'aria-label': title, text: t.text });
 }
 
 function fmtDay(ts) {
@@ -328,10 +375,12 @@ async function showContact(fp) {
   const k = engine.keyring.get(fp);
   const nick = h('input', { value: c?.nick || '', placeholder: k?.name || '', maxlength: 64 });
   const safety = await safetyNumber(engine.identity.fp, fp);
+  const dc = engine.convs.get(await directConvId(engine.identity.fp, fp));
+  const hasHistory = dc && engine.views.get(dc.id).list().length > 0;
   openDialog(engine.displayName(fp),
     h('div', { class: 'row' }, avatar(fp, engine.displayName(fp), net.isOnline(fp)),
       h('div', {}, h('div', { class: 'strong', text: k?.name || '(no name)' }),
-        h('div', { class: 'muted small', text: net.isOnline(fp) ? 'Connected directly now' : 'Not connected' }))),
+        h('div', { class: 'muted small', text: net.isOnline(fp) ? 'Connected directly now' : engine.seen[fp] ? 'Last seen ' + fmtAgo(engine.seen[fp]) : 'Not connected' }))),
     c ? h('label', {}, 'Nickname (only you see this)', nick) : h('p', { class: 'muted small', text: 'Not in your contacts — known because you share a group.' }),
     h('h3', { text: 'Safety number' }),
     h('div', { class: 'safety', text: safety }),
@@ -339,13 +388,51 @@ async function showContact(fp) {
     h('h3', { text: 'Their fingerprint' }),
     h('div', { class: 'mono', text: fp }),
     h('div', { class: 'row end', style: 'margin-top:1em' },
+      hasHistory ? h('button', { class: 'danger', text: 'Delete chat', onclick: () => deleteChat(dc.id) }) : null,
       c ? h('button', { class: 'danger', text: 'Remove contact', onclick: async () => {
-        if (!confirm('Remove this contact? Your message history with them is kept.')) return;
+        if (!confirm('Remove this contact? Your message history with them is kept (use Delete chat to remove it).')) return;
         await engine.removeContact(fp); closeDialog(); render();
       } }) : h('button', { text: 'Add to contacts', onclick: async () => { await engine.addContact(k.card); closeDialog(); render(); } }),
       c ? h('button', { text: 'Save', onclick: async () => { await engine.setNick(fp, nick.value); closeDialog(); render(); } }) : null,
       h('button', { class: 'primary', text: 'Message', onclick: async () => { const conv = await engine.directConv(fp); closeDialog(); render(); openConv(conv.id); } })),
   );
+}
+
+function showMessage(convId, m) {
+  const conv = engine.convs.get(convId);
+  const mine = m.author === engine.identity.fp;
+  const r = mine && !m.deleted ? engine.receiptState(convId, m) : null;
+  const label = { read: 'Read', got: 'Delivered', relay: 'In their mailbox', null: 'Not delivered yet' };
+  openDialog('Message',
+    m.deleted ? h('p', { class: 'muted', text: 'Message deleted' }) : h('div', { class: 'quote', text: m.text.length > 400 ? m.text.slice(0, 400) + '…' : m.text }),
+    h('p', { class: 'muted small', text: `${mine ? 'You' : engine.displayName(m.author)} · ${fmtDay(m.ts)} ${fmtTime(m.ts)}` }),
+    r ? h('ul', { class: 'list receipts' }, Object.entries(r.members).map(([fp, st]) => h('li', { class: 'static' },
+      avatar(fp, engine.displayName(fp)),
+      h('div', { class: 'info' }, h('div', { class: 'title' }, h('span', { text: engine.displayName(fp) })),
+        h('div', { class: 'preview', text: label[st] }))))) : null,
+    h('div', { class: 'row end', style: 'margin-top:1em' },
+      m.deleted ? null : h('button', { text: 'Copy text', onclick: () => { copy(m.text); closeDialog(); } }),
+      h('button', { text: 'Delete for me', title: 'Removes it from your devices only', onclick: async () => {
+        await engine.forgetMessages(convId, [m.id]); selectedMsg = null; closeDialog();
+      } }),
+      mine && !m.deleted ? h('button', { class: 'danger', text: 'Delete for everyone', onclick: async () => {
+        if (!confirm(conv.kind === 'group' ? 'Delete this message for everyone in the group?' : 'Delete this message for everyone?')) return;
+        await engine.deleteMessage(convId, m.id); selectedMsg = null; closeDialog();
+      } }) : null),
+  );
+}
+
+/** Clear a chat's history from this device and our other devices, and drop it from the list. */
+async function deleteChat(convId) {
+  const conv = engine.convs.get(convId);
+  const others = conv.kind === 'group' ? 'Other members keep their copies.' : `${engine.convTitle(conv)} keeps their copy.`;
+  if (!confirm(`Delete this chat? Its messages are removed from this device and your other devices. ${others}`)) return false;
+  await engine.clearConv(convId, { hide: true });
+  if (currentConv === convId) currentConv = null;
+  closeDialog();
+  render();
+  toast('Chat deleted');
+  return true;
 }
 
 function showGroup(convId) {
@@ -366,6 +453,8 @@ function showGroup(convId) {
     }, avatar(fp, engine.displayName(fp), fp === engine.identity.fp ? undefined : net.isOnline(fp)),
       h('div', { class: 'info' }, h('div', { class: 'title' }, h('span', { text: engine.displayName(fp) })),
         h('div', { class: 'preview', text: fp === conv.createdBy ? 'Created the group' : (engine.isContact(fp) ? 'Contact' : 'Not in your contacts') }))))),
+    h('div', { class: 'row end', style: 'margin-top:1em' },
+      h('button', { class: 'danger', text: 'Delete chat history', onclick: () => deleteChat(convId) })),
   );
 }
 
@@ -378,6 +467,7 @@ function showSettings() {
   const bgStatus = h('div', { class: 'muted small', text: 'Background checks: …' });
   backgroundSyncState().then((st) => { bgStatus.textContent = 'Background checks: ' + BG_TEXT[st]; });
   const notif = h('input', { type: 'checkbox', checked: !!s.notifications });
+  const receipts = h('input', { type: 'checkbox', checked: s.receipts !== false, 'aria-label': 'Send read receipts and typing indicators' });
   const pass = h('input', { type: 'password', placeholder: 'Backup passphrase', autocomplete: 'new-password' });
 
   openDialog('Settings',
@@ -389,6 +479,7 @@ function showSettings() {
     h('label', {}, 'Your mailbox relays (optional, up to 4). Only list Nostr relays you run or trust: contacts store encrypted messages there for you while you are offline, kept for at most 7 days. Public relays above never store anything.', mailbox),
     bgStatus,
     h('label', { class: 'row' }, notif, h('span', { text: 'Show notifications for new messages' })),
+    h('label', { class: 'row' }, receipts, h('span', { text: 'Send read receipts and typing indicators (delivery is always visible)' })),
     h('div', { class: 'row end' }, h('button', { class: 'primary', text: 'Save settings', onclick: async () => {
       if (name.value.trim() && name.value !== engine.identity.name) await engine.setName(name.value);
       const lines = (t) => t.value.split(/\s+/).map((x) => x.trim()).filter(Boolean);
@@ -398,7 +489,7 @@ function showSettings() {
       }
       const mb = lines(mailbox);
       if (mb.some((u) => !/^wss?:\/\//.test(u))) return toast('Mailbox relays must start with wss://');
-      await engine.saveSettings({ relays: lines(relays), iceServers: lines(ice), mailboxRelays: mb, notifications: notif.checked });
+      await engine.saveSettings({ relays: lines(relays), iceServers: lines(ice), mailboxRelays: mb, notifications: notif.checked, receipts: receipts.checked });
       setupBackgroundSync();
       toast('Saved'); closeDialog(); render();
     } })),
@@ -555,6 +646,49 @@ function renderStatus() {
   $('offlineNote').hidden = online;
 }
 
+function highlighted(text, words) {
+  // Show the text around the first match, with matches marked (folding keeps lengths for most scripts).
+  const fold = (t) => t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const f = fold(text);
+  const at = words.length ? f.indexOf(words[0]) : -1;
+  const start = at > 40 ? at - 30 : 0;
+  const part = text.slice(start, start + 160);
+  const prefix = start ? '…' : '';
+  if (f.length !== text.length) return [prefix + part];
+  const fp = f.slice(start, start + 160);
+  const marks = [];
+  for (const w of words) for (let i = fp.indexOf(w); i >= 0 && w; i = fp.indexOf(w, i + w.length)) marks.push([i, i + w.length]);
+  marks.sort((a, b) => a[0] - b[0]);
+  const out = [prefix];
+  let pos = 0;
+  for (const [a, b] of marks) {
+    if (a < pos) continue;
+    out.push(part.slice(pos, a), h('mark', { text: part.slice(a, b) }));
+    pos = b;
+  }
+  out.push(part.slice(pos));
+  return out;
+}
+
+function renderSearch() {
+  const box = $('searchResults');
+  const q = searchQuery.trim();
+  $('convList').hidden = currentTab !== 'chats' || !!q;
+  box.hidden = currentTab !== 'chats' || !q;
+  if (!q) return;
+  const words = q.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().split(/\s+/).filter(Boolean);
+  const results = engine.search(q);
+  box.replaceChildren(...(results.length ? results.map(({ conv: id, msg }) => {
+    const conv = engine.convs.get(id);
+    const who = msg.author === engine.identity.fp ? 'You: ' : conv.kind === 'group' ? engine.displayName(msg.author) + ': ' : '';
+    return h('li', { onclick: () => openConv(id, msg.id) },
+      avatar(conv.kind === 'direct' ? conv.members.find((m) => m !== engine.identity.fp) : id.slice(2), engine.convTitle(conv)),
+      h('div', { class: 'info' },
+        h('div', { class: 'title' }, h('span', { text: engine.convTitle(conv) }), h('span', { class: 'muted small', text: fmtDay(msg.ts) })),
+        h('div', { class: 'preview' }, who, ...highlighted(msg.text, words))));
+  }) : [h('li', { class: 'empty' }, h('p', { text: 'No messages match.' }))]));
+}
+
 function renderLists() {
   $('myName').textContent = engine.identity.name;
   // Conversations
@@ -563,12 +697,13 @@ function renderLists() {
   list.replaceChildren(...(convs.length ? convs.map(({ conv, title, last, unread }) => {
     const other = conv.kind === 'direct' ? conv.members.find((m) => m !== engine.identity.fp) : null;
     const online = other ? net.isOnline(other) : conv.members.some((m) => m !== engine.identity.fp && net.isOnline(m));
-    const preview = last ? (conv.kind === 'group' && last.author !== engine.identity.fp ? engine.displayName(last.author) + ': ' : (last.author === engine.identity.fp ? 'You: ' : '')) + last.text : (conv.kind === 'group' ? 'Group created' : 'No messages yet');
+    const typingNow = typingText(conv.id, conv.kind === 'group');
+    const preview = typingNow || (last ? (conv.kind === 'group' && last.author !== engine.identity.fp ? engine.displayName(last.author) + ': ' : (last.author === engine.identity.fp ? 'You: ' : '')) + last.text : (conv.kind === 'group' ? 'Group created' : 'No messages yet'));
     return h('li', { class: conv.id === currentConv ? 'active' : '', onclick: () => openConv(conv.id), dataset: { conv: conv.id } },
       avatar(other || conv.id.slice(2), title, online),
       h('div', { class: 'info' },
         h('div', { class: 'title' }, h('span', { text: title }), last ? h('span', { class: 'muted small', text: fmtTime(last.ts) }) : null),
-        h('div', { class: 'row' }, h('div', { class: 'preview grow', text: preview }), unread ? h('span', { class: 'badge', text: String(unread) }) : null)));
+        h('div', { class: 'row' }, h('div', { class: 'preview grow' + (typingNow ? ' typing' : ''), text: preview }), unread ? h('span', { class: 'badge', text: String(unread) }) : null)));
   }) : [h('li', { class: 'empty' }, h('p', { text: 'No conversations yet. Invite someone to start chatting.' }), h('button', { class: 'primary', text: 'Invite someone', onclick: () => showAddContact() }), h('button', { class: 'link', text: 'Share my link', onclick: shareMyLink }))]));
 
   // Contacts + requests
@@ -588,9 +723,10 @@ function renderLists() {
       avatar(c.fp, engine.displayName(c.fp), net.isOnline(c.fp)),
       h('div', { class: 'info' },
         h('div', { class: 'title' }, h('span', { text: engine.displayName(c.fp) })),
-        h('div', { class: 'preview', text: net.isOnline(c.fp) ? 'Online' : 'Offline' })))) : (reqs.length ? [] : [h('li', { class: 'empty' }, h('p', { text: 'No contacts yet.' }), h('button', { class: 'primary', text: 'Invite someone', onclick: () => showAddContact() }))])),
+        h('div', { class: 'preview', text: net.isOnline(c.fp) ? 'Online' : engine.seen[c.fp] ? 'Last seen ' + fmtAgo(engine.seen[c.fp]) : 'Offline' })))) : (reqs.length ? [] : [h('li', { class: 'empty' }, h('p', { text: 'No contacts yet.' }), h('button', { class: 'primary', text: 'Invite someone', onclick: () => showAddContact() }))])),
   );
 
+  renderSearch();
   const totalUnread = convs.reduce((n, c) => n + c.unread, 0);
   document.title = (totalUnread ? `(${totalUnread}) ` : '') + 'Walkie-Talkie';
   navigator.setAppBadge?.(totalUnread).catch?.(() => {});
@@ -606,9 +742,15 @@ function renderChat() {
   const view = engine.views.get(currentConv);
   const me = engine.identity.fp;
   $('chatTitle').textContent = engine.convTitle(conv);
-  if (conv.kind === 'direct') {
+  const typingNow = typingText(conv.id, conv.kind === 'group');
+  $('chatSub').classList.toggle('typing', !!typingNow);
+  if (typingNow) {
+    $('chatSub').textContent = typingNow;
+  } else if (conv.kind === 'direct') {
     const other = conv.members.find((m) => m !== me);
-    $('chatSub').textContent = net.isOnline(other) ? '● Connected directly' : 'Offline · messages sync when you are both online';
+    $('chatSub').textContent = net.isOnline(other) ? '● Online' : engine.seen[other]
+      ? `Last seen ${fmtAgo(engine.seen[other])} · messages sync when you're both online`
+      : 'Offline · messages sync when you are both online';
   } else {
     const on = conv.members.filter((m) => m !== me && net.isOnline(m)).length;
     $('chatSub').textContent = `${conv.members.length} members · ${on} online`;
@@ -625,18 +767,30 @@ function renderChat() {
     const mine = m.author === me;
     const first = m.author !== lastAuthor;
     lastAuthor = m.author;
-    const cls = 'msg' + (mine ? ' mine' : '') + (first ? ' first' : '') + (m.deleted ? ' deleted' : '');
-    items.push(h('div', { class: cls, dataset: { id: m.id } },
+    const cls = 'msg' + (mine ? ' mine' : '') + (first ? ' first' : '') + (m.deleted ? ' deleted' : '') + (m.id === selectedMsg ? ' sel' : '');
+    const convId = currentConv;
+    items.push(h('div', { class: cls, dataset: { id: m.id }, onclick: (e) => {
+      if (e.target.closest('button') || getSelection().toString()) return;
+      selectedMsg = selectedMsg === m.id ? null : m.id;
+      for (const el of box.querySelectorAll('.msg.sel')) el.classList.remove('sel');
+      if (selectedMsg) e.currentTarget.classList.add('sel');
+    } },
       first && !mine && conv.kind === 'group' ? h('div', { class: 'who', text: engine.displayName(m.author) }) : null,
       m.deleted ? 'Message deleted' : m.text,
-      h('span', { class: 'meta', text: fmtTime(m.ts) }),
-      mine && !m.deleted ? h('button', { class: 'del', title: 'Delete for everyone', 'aria-label': 'Delete', text: '✕', onclick: async () => {
-        if (confirm('Delete this message for everyone?')) await engine.deleteMessage(currentConv, m.id);
-      } }) : null));
+      h('span', { class: 'meta' }, fmtTime(m.ts), mine && !m.deleted ? tickFor(convId, m) : null),
+      h('button', { class: 'more', title: 'Message options', 'aria-label': 'Message options', text: '⋯', onclick: () => showMessage(convId, m) })));
   }
+  const tn = typingText(conv.id, conv.kind === 'group');
+  if (tn) items.push(h('div', { class: 'typing-row', text: tn }));
   box.replaceChildren(...items);
-  if (atBottom || renderChat.forceScroll) box.scrollTop = box.scrollHeight;
+  const target = renderChat.scrollTo && box.querySelector(`[data-id="${CSS.escape(renderChat.scrollTo)}"]`);
+  if (target) {
+    target.scrollIntoView({ block: 'center' });
+    target.classList.add('flash');
+    setTimeout(() => target.classList.remove('flash'), 2000);
+  } else if (atBottom || renderChat.forceScroll) box.scrollTop = box.scrollHeight;
   renderChat.forceScroll = false;
+  renderChat.scrollTo = null;
   if (document.visibilityState === 'visible') engine.markRead(currentConv);
 }
 
@@ -653,11 +807,42 @@ function scheduleRender() {
   requestAnimationFrame(() => { renderQueued = false; render(); });
 }
 
-function openConv(id) {
+function openConv(id, scrollTo = null) {
+  if (currentConv !== id) { stopTyping(); selectedMsg = null; }
   currentConv = id;
-  renderChat.forceScroll = true;
+  renderChat.forceScroll = !scrollTo;
+  renderChat.scrollTo = scrollTo;
   render();
-  if (matchMedia('(min-width: 761px)').matches) $('composerInput').focus();
+  if (!scrollTo && matchMedia('(min-width: 761px)').matches) $('composerInput').focus();
+}
+
+// ------------------------------------------------------------------ typing
+
+const TYPING_RESEND_MS = 3000;  // while typing, say so again this often…
+const TYPING_SHOW_MS = 6000;    // …and the other side shows it for this long after the last one
+let typingSent = null;          // {conv, at}
+
+function onComposerInput() {
+  if (!currentConv) return;
+  if (!$('composerInput').value.trim()) return stopTyping();
+  const now = Date.now();
+  if (typingSent?.conv === currentConv && now - typingSent.at < TYPING_RESEND_MS) return;
+  typingSent = { conv: currentConv, at: now };
+  net.sendTyping(currentConv, true);
+}
+
+function stopTyping() {
+  if (!typingSent) return;
+  net.sendTyping(typingSent.conv, false);
+  typingSent = null;
+}
+
+function onTyping({ fp, conv, on }) {
+  let m = typing.get(conv);
+  if (!m) { m = new Map(); typing.set(conv, m); }
+  if (on) m.set(fp, Date.now() + TYPING_SHOW_MS); else m.delete(fp);
+  scheduleRender();
+  if (on) setTimeout(scheduleRender, TYPING_SHOW_MS + 100);
 }
 
 // ------------------------------------------------------------------ notifications
@@ -686,7 +871,7 @@ function wireMain() {
   $('statusPill').onclick = () => toast(net.pool.status().connected
     ? 'Relays only help peers find each other. Messages travel directly, encrypted, between devices.'
     : 'Not connected to any relay. You can still connect with direct connection codes in Settings.', null, 6000);
-  $('btnBack').onclick = () => { currentConv = null; render(); };
+  $('btnBack').onclick = () => { stopTyping(); currentConv = null; render(); };
   $('chatTitleBtn').onclick = () => {
     const conv = engine.convs.get(currentConv);
     if (!conv) return;
@@ -697,13 +882,18 @@ function wireMain() {
     b.onclick = () => {
       currentTab = b.dataset.tab;
       for (const x of document.querySelectorAll('.tabs button')) x.classList.toggle('active', x === b);
-      $('convList').hidden = currentTab !== 'chats';
       $('contactList').hidden = currentTab !== 'contacts';
+      $('searchBar').hidden = currentTab !== 'chats';
+      renderSearch();
     };
   }
+  $('search').addEventListener('input', (e) => { searchQuery = e.target.value; renderSearch(); });
+  $('search').addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.target.value = searchQuery = ''; renderSearch(); } });
   const input = $('composerInput');
   const resize = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, innerHeight * 0.3) + 'px'; };
   input.addEventListener('input', resize);
+  input.addEventListener('input', onComposerInput);
+  input.addEventListener('blur', stopTyping);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('composer').requestSubmit(); }
   });
@@ -712,6 +902,7 @@ function wireMain() {
     const text = input.value;
     if (!text.trim() || !currentConv) return;
     input.value = ''; resize();
+    stopTyping();
     renderChat.forceScroll = true;
     await engine.sendText(currentConv, text);
   });
@@ -757,15 +948,21 @@ async function startApp() {
   wireMain();
   net = new Network(engine);
   engine.addEventListener('op', (e) => {
+    // A message arriving means they've stopped typing it.
+    if (!e.detail.local && e.detail.body.type === 'msg') typing.get(e.detail.conv)?.delete(e.detail.env.author);
     scheduleRender();
     if (!e.detail.local) notify(e.detail.conv, e.detail.env, e.detail.body);
   });
+  net.addEventListener('typing', (e) => onTyping(e.detail));
   engine.addEventListener('change', (e) => {
     scheduleRender();
     if (e.detail.what === 'requests' && e.detail.fp) toast(`${engine.displayName(e.detail.fp)} wants to connect`, { label: 'View', run: () => document.querySelector('[data-tab=contacts]').click() });
   });
   engine.addEventListener('settings', scheduleRender);
-  net.addEventListener('peers', scheduleRender);
+  net.addEventListener('peers', (e) => {
+    if (!e.detail.online) for (const m of typing.values()) m.delete(e.detail.fp);
+    scheduleRender();
+  });
   net.addEventListener('invited', async (e) => {
     const conv = await engine.directConv(e.detail.fp);
     toast(`${engine.displayName(e.detail.fp)} added you from your link`, { label: 'Say hi', run: () => openConv(conv.id) });

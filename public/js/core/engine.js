@@ -4,10 +4,10 @@
 
 import {
   generateIdentity, importIdentity, exportIdentity, importCard, sealOp, openOp, verifyOp,
-  isWellFormedOp, encryptBackup, decryptBackup,
+  isWellFormedOp, encryptBackup, decryptBackup, sign, verify,
 } from './crypto.js';
 import { OpLog, ConversationView, msgId, streamOf, PINNED_TYPES } from './crdt.js';
-import { utf8, hex, sha256, b64u, randomBytes } from './encoding.js';
+import { utf8, hex, sha256, b64u, fromB64u, randomBytes, canonical } from './encoding.js';
 
 const newDeviceId = () => hex(randomBytes(8));
 const newInvite = () => ({ token: b64u(randomBytes(16)), at: Date.now() });
@@ -20,6 +20,9 @@ export const DEFAULT_SETTINGS = {
   // Never public relays: those only ever see ephemeral signalling.
   mailboxRelays: [],
   notifications: false,
+  // Tell contacts when you've read their messages and when you're typing.
+  // (Delivery is visible to them regardless: it's implied by what your device syncs.)
+  receipts: true,
 };
 
 const MAX_MAILBOXES = 4;
@@ -30,6 +33,33 @@ export const DEFAULT_RETENTION_DAYS = 365;
 export const RETENTION_CHOICES = [7, 30, 90, 365, 730];
 export const clampRetention = (d) => (Number.isSafeInteger(d) && d >= 1 && d <= 3650 ? d : DEFAULT_RETENTION_DAYS);
 const MAX_FUTURE_MS = DAY_MS; // tolerated clock skew for op timestamps
+const STREAM_RE = /^[0-9a-f]{40}\/[0-9a-f]{16}$/;
+const MAX_FORGET_IDS = 5000;
+
+/** Header-only copy of an op: keeps its place in the version vector, holds no content. */
+const stubOf = (env) => ({ v: env.v, conv: env.conv, author: env.author, dev: env.dev, seq: env.seq, lamport: env.lamport, ts: env.ts, stub: true });
+
+/** A version vector from the network: {stream: seq}, bounded. Returns null if malformed. */
+export function cleanVV(vv) {
+  if (!vv || typeof vv !== 'object' || Array.isArray(vv)) return null;
+  const out = {};
+  let n = 0;
+  for (const [k, v] of Object.entries(vv)) {
+    if (++n > 512) break;
+    if (STREAM_RE.test(k) && Number.isSafeInteger(v) && v > 0) out[k] = v;
+  }
+  return out;
+}
+
+/** Raise a's entries to b's (version-vector max). Returns true if anything changed. */
+function maxInto(a, b) {
+  let changed = false;
+  for (const [k, v] of Object.entries(b || {})) if (v > (a[k] || 0)) { a[k] = v; changed = true; }
+  return changed;
+}
+
+/** Lowercase, accent-free form used for search. */
+const fold = (t) => t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 export function cleanRelayList(list) {
   return [...new Set((Array.isArray(list) ? list : []).filter((u) => typeof u === 'string' && /^wss?:\/\/[^\s]{1,200}$/.test(u)))].slice(0, MAX_MAILBOXES);
 }
@@ -66,6 +96,13 @@ export class Engine extends EventTarget {
     this.removed = {};          // fp -> ms: contact removals, merged across our own devices
     this.nameAt = 0;            // when our display name last changed (merged across our devices)
     this.invite = null;         // {token, at}: secret in our contact link; whoever presents it is auto-accepted
+    // conv -> {fp -> {got: vv, read: lamport, relay: vv}}: what each member has received
+    // (on a device, or in their mailbox) and read. Monotonic; merged by max.
+    this.receipts = new Map();
+    // conv -> {upTo: vv, ids: Set<msgId>, hide}: messages deleted "for me" (this identity only).
+    this.forgets = new Map();
+    this.seen = {};             // fp -> ms: when we were last connected to them
+    this.relayRcpt = new Map(); // group conv -> {fp -> signed receipt}: passed on to members who can't reach fp
     this.now = () => Date.now(); // overridable clock (tests)
     this._queue = Promise.resolve();
   }
@@ -104,6 +141,11 @@ export class Engine extends EventTarget {
     for (const [fp, list] of Object.entries((await this.store.get('kv', 'mailboxes')) || {})) this.mailboxes.set(fp, list);
     for (const [fp, keys] of Object.entries((await this.store.get('kv', 'outbox')) || {})) this.outbox.set(fp, new Set(keys));
     this.mailSince = (await this.store.get('kv', 'mailSince')) || 0;
+    this.seen = (await this.store.get('kv', 'seen')) || {};
+    for (const [conv, r] of Object.entries((await this.store.get('kv', 'receipts')) || {})) this.receipts.set(conv, r);
+    for (const [conv, f] of Object.entries((await this.store.get('kv', 'forgets')) || {})) {
+      this.forgets.set(conv, { upTo: f.upTo || {}, ids: new Set(f.ids || []), hide: !!f.hide });
+    }
     for (const conv of await this.store.all('convs')) {
       for (const card of Object.values(conv.memberCards || {})) {
         if (!this.keyring.has(card.fp)) {
@@ -116,9 +158,14 @@ export class Engine extends EventTarget {
     for (const env of ops) {
       const conv = this.convs.get(env.conv);
       if (!conv) continue;
+      if (env.stub) {
+        this.logs.get(env.conv).add(env);
+        if (env.lamport > this.clock) this.clock = env.lamport;
+        continue;
+      }
       try {
         const body = await openOp(this.identity, env);
-        this._applyOp(env, body);
+        this._applyOp(env, body, body.type === 'msg' && this._isForgotten(env));
         if (env.author === this.identity.fp && env.dev === this.device && env.ts > this.lastTs) this.lastTs = env.ts;
       } catch (e) { console.warn('stored op unreadable', e); }
     }
@@ -384,7 +431,10 @@ export class Engine extends EventTarget {
   }
 
   conversations() {
-    return [...this.convs.values()].map((conv) => {
+    return [...this.convs.values()].filter((conv) => {
+      // A deleted chat stays out of the list until a new message arrives.
+      return !this.forgets.get(conv.id)?.hide || this.views.get(conv.id).list().length > 0;
+    }).map((conv) => {
       const view = this.views.get(conv.id);
       const last = view.last();
       const unread = view.list().filter((m) => m.author !== this.identity.fp && !m.deleted && m.lamport > (conv.readUpTo || 0)).length;
@@ -392,13 +442,213 @@ export class Engine extends EventTarget {
     }).sort((a, b) => b.sortKey - a.sortKey);
   }
 
-  async markRead(convId) {
+  async markRead(convId, upTo) {
     const conv = this.convs.get(convId);
-    const last = this.views.get(convId)?.list().at(-1);
-    if (!conv || !last || (conv.readUpTo || 0) >= last.lamport) return;
-    conv.readUpTo = last.lamport;
+    if (upTo === undefined) upTo = this.views.get(convId)?.list().at(-1)?.lamport;
+    if (!conv || !upTo || (conv.readUpTo || 0) >= upTo) return;
+    const from = conv.readUpTo || 0;
+    conv.readUpTo = upTo;
     await this.store.put('convs', convId, conv);
-    this._emit('change', { what: 'read', conv: convId });
+    this._emit('change', { what: 'read', conv: convId, from, to: upTo });
+  }
+
+  // ------------------------------------------------------------ receipts
+
+  /** Our receipt for a conversation, as sent to its members. */
+  myReceipt(convId) {
+    const r = { got: this.vv(convId) };
+    if (this.settings.receipts !== false) r.read = this.convs.get(convId)?.readUpTo || 0;
+    return r;
+  }
+
+  /**
+   * Record what member fp has: `got` (ops on one of their devices), `read` (Lamport mark of
+   * what they've seen) and `relay` (ops their mailbox relay acknowledged). Only ever raised.
+   */
+  async noteReceipt(convId, fp, { got, read, relay } = {}) {
+    const conv = this.convs.get(convId);
+    if (!conv || fp === this.identity.fp || !conv.members.includes(fp)) return false;
+    let byFp = this.receipts.get(convId);
+    if (!byFp) { byFp = {}; this.receipts.set(convId, byFp); }
+    const r = byFp[fp] || (byFp[fp] = { got: {}, read: 0, relay: {} });
+    let changed = false;
+    const g = got && cleanVV(got);
+    if (g) changed = maxInto(r.got, g) || changed;
+    const rl = relay && cleanVV(relay);
+    if (rl) changed = maxInto(r.relay, rl) || changed;
+    if (Number.isSafeInteger(read) && read > r.read && read <= this.clock + 1e6) { r.read = read; changed = true; }
+    if (changed) {
+      await this._saveReceipts();
+      this._emit('change', { what: 'receipts', conv: convId, fp });
+    }
+    return changed;
+  }
+
+  /**
+   * Our receipt, signed, so other group members can pass it on to people we aren't
+   * connected to (as with ops, the members relaying it can't forge or alter it).
+   */
+  async signedReceipt(convId) {
+    const r = this.myReceipt(convId);
+    const body = { conv: convId, fp: this.identity.fp, got: r.got, read: r.read || 0 };
+    return { ...body, sig: b64u(await sign(this.identity, utf8('iwt-rcpt-v1|' + canonical(body)))) };
+  }
+
+  /** Verify and merge someone's signed receipt. Returns true if it told us something new. */
+  async ingestSignedReceipt(r) {
+    if (!r || typeof r !== 'object' || typeof r.conv !== 'string' || typeof r.fp !== 'string' || typeof r.sig !== 'string') return false;
+    const conv = this.convs.get(r.conv);
+    const key = this.keyring.get(r.fp);
+    if (!conv || !key || r.fp === this.identity.fp || !conv.members.includes(r.fp)) return false;
+    const got = cleanVV(r.got);
+    const read = Number.isSafeInteger(r.read) && r.read >= 0 ? r.read : null;
+    if (!got || read === null) return false;
+    let ok = false;
+    try { ok = await verify(key.signKey, fromB64u(r.sig), utf8('iwt-rcpt-v1|' + canonical({ conv: r.conv, fp: r.fp, got: r.got, read: r.read }))); } catch {}
+    if (!ok || !(await this.noteReceipt(r.conv, r.fp, { got, read }))) return false;
+    if (conv.kind === 'group') {
+      let m = this.relayRcpt.get(r.conv);
+      if (!m) { m = {}; this.relayRcpt.set(r.conv, m); }
+      m[r.fp] = { conv: r.conv, fp: r.fp, got: r.got, read: r.read, sig: r.sig };
+    }
+    return true;
+  }
+
+  /** Other members' signed receipts we hold for a group, to pass on. */
+  relayReceipts(convId) {
+    return Object.values(this.relayRcpt.get(convId) || {});
+  }
+
+  /** A mailbox relay of fp acknowledged these ops of ours. */
+  async noteRelayed(fp, envs) {
+    const byConv = new Map();
+    for (const env of envs) {
+      const vv = byConv.get(env.conv) || {};
+      const st = streamOf(env);
+      vv[st] = Math.max(vv[st] || 0, env.seq);
+      byConv.set(env.conv, vv);
+    }
+    for (const [conv, relay] of byConv) await this.noteReceipt(conv, fp, { relay });
+  }
+
+  _saveReceipts() {
+    return this.store.put('kv', 'receipts', Object.fromEntries(this.receipts));
+  }
+
+  /**
+   * Delivery state of one of our messages for each other member: 'read', 'got' (on one of
+   * their devices), 'relay' (in their mailbox) or null. `state` is the least advanced.
+   */
+  receiptState(convId, m) {
+    const conv = this.convs.get(convId);
+    const st = m.author + '/' + m.dev;
+    const byFp = this.receipts.get(convId) || {};
+    const rank = { read: 3, got: 2, relay: 1 };
+    const members = {};
+    let state = 'read';
+    for (const fp of conv.members) {
+      if (fp === this.identity.fp) continue;
+      const r = byFp[fp];
+      const s = !r ? null : r.read >= m.lamport ? 'read' : (r.got[st] || 0) >= m.seq ? 'got' : (r.relay[st] || 0) >= m.seq ? 'relay' : null;
+      members[fp] = s;
+      if ((rank[s] || 0) < (rank[state] || 0)) state = s;
+    }
+    return { state, members };
+  }
+
+  // ------------------------------------------------------------ last seen
+
+  /** We're connected to fp right now (or just were). Written to disk at most once a minute, plus on disconnect. */
+  async noteSeen(fp, { flush = false } = {}) {
+    const now = this.now();
+    this.seen[fp] = now;
+    if (!flush && now - (this._seenSaved || 0) < 60000) return;
+    this._seenSaved = now;
+    await this.store.put('kv', 'seen', this.seen);
+  }
+
+  // ------------------------------------------------------------ delete for me
+
+  _isForgotten(env) {
+    const f = this.forgets.get(env.conv);
+    return !!f && (f.ids.has(msgId(env)) || env.seq <= (f.upTo[streamOf(env)] || 0));
+  }
+
+  _forgetEntry(convId) {
+    let f = this.forgets.get(convId);
+    if (!f) { f = { upTo: {}, ids: new Set(), hide: false }; this.forgets.set(convId, f); }
+    return f;
+  }
+
+  _saveForgets() {
+    return this.store.put('kv', 'forgets', Object.fromEntries([...this.forgets].map(([c, f]) => [c, { upTo: f.upTo, ids: [...f.ids], hide: f.hide }])));
+  }
+
+  /**
+   * Remove messages from this replica's view and drop their content. Other people's ops
+   * become header-only stubs; our own keep their (encrypted) envelope so they still reach
+   * members who don't have them yet.
+   */
+  async _dropForgotten(convId) {
+    const view = this.views.get(convId);
+    const log = this.logs.get(convId);
+    for (const m of [...view.messages.values()]) {
+      const env = log.get(m.author + '/' + m.dev, m.seq);
+      if (!env || !this._isForgotten(env)) continue;
+      view.hide(m.id);
+      if (m.author !== this.identity.fp && !env.stub) {
+        const stub = stubOf(env);
+        log.replace(stub);
+        await this.store.put('ops', opKey(env), stub);
+      }
+    }
+  }
+
+  /** "Delete for me": these messages disappear from all of our own devices only. */
+  forgetMessages(convId, ids) {
+    return this._serial(async () => {
+      if (!this.convs.has(convId)) return;
+      const f = this._forgetEntry(convId);
+      for (const id of ids) if (typeof id === 'string' && f.ids.size < MAX_FORGET_IDS) f.ids.add(id);
+      await this._saveForgets();
+      await this._dropForgotten(convId);
+      this._emit('change', { what: 'forget', conv: convId });
+    });
+  }
+
+  /**
+   * Clear a chat's history on our devices (every message received so far). With hide, the
+   * chat also leaves the list until someone writes in it again.
+   */
+  clearConv(convId, { hide = false } = {}) {
+    return this._serial(async () => {
+      const log = this.logs.get(convId);
+      if (!log) return;
+      const f = this._forgetEntry(convId);
+      for (const [st, m] of log.byAuthor) if (m.size) f.upTo[st] = Math.max(f.upTo[st] || 0, ...m.keys());
+      f.ids.clear(); // covered by upTo
+      f.hide = hide;
+      await this._saveForgets();
+      await this._dropForgotten(convId);
+      this._emit('change', { what: 'forget', conv: convId });
+    });
+  }
+
+  // ------------------------------------------------------------ search
+
+  /** Messages containing every word of `query`, newest first. */
+  search(query, limit = 100) {
+    const words = fold(String(query)).split(/\s+/).filter(Boolean);
+    if (!words.length) return [];
+    const out = [];
+    for (const conv of this.convs.values()) {
+      for (const m of this.views.get(conv.id).list()) {
+        if (m.deleted) continue;
+        const t = fold(m.text);
+        if (words.every((w) => t.includes(w))) out.push({ conv: conv.id, msg: m });
+      }
+    }
+    return out.sort((a, b) => b.msg.ts - a.msg.ts).slice(0, limit);
   }
 
   retentionDays(conv) {
@@ -424,6 +674,15 @@ export class Engine extends EventTarget {
         for (const e of dropped) await this.store.del('ops', opKey(e));
         view.remove(log.pinned.has(msgId(wm)) ? dropped : [...dropped, wm]);
         changed = true;
+      }
+      const f = this.forgets.get(conv.id);
+      if (f?.ids.size) {
+        const n = f.ids.size;
+        for (const id of f.ids) {
+          const [a, d, seq] = id.split(':');
+          if (Number(seq) <= log.floor(a + '/' + d) && !log.has(a + '/' + d, Number(seq))) f.ids.delete(id);
+        }
+        if (f.ids.size !== n) await this._saveForgets();
       }
     }
     if (changed) this._emit('change', { what: 'expired' });
@@ -481,10 +740,10 @@ export class Engine extends EventTarget {
     return env;
   }
 
-  _applyOp(env, body) {
+  _applyOp(env, body, hidden = false) {
     const log = this.logs.get(env.conv);
     if (!log.add(env, PINNED_TYPES.has(body.type))) return false;
-    this.views.get(env.conv).apply(env, body);
+    if (!hidden) this.views.get(env.conv).apply(env, body);
     if (env.lamport > this.clock) this.clock = env.lamport;
     return true;
   }
@@ -569,8 +828,11 @@ export class Engine extends EventTarget {
       this._registerConv(newConv);
       await this.store.put('convs', newConv.id, newConv);
     }
-    await this.store.put('ops', opKey(env), env);
-    this._applyOp(env, body);
+    // A message we deleted "for me" (e.g. a late copy, or deleted on our other device first).
+    const forgotten = body.type === 'msg' && this._isForgotten(env);
+    const kept = forgotten && env.author !== me ? stubOf(env) : env;
+    await this.store.put('ops', opKey(env), kept);
+    this._applyOp(kept, body, forgotten);
     if (expired) {
       await this._prune();
       return { added: true, expired: true };
@@ -612,7 +874,9 @@ export class Engine extends EventTarget {
       removed: this.removed,
       nameAt: this.nameAt,
       convs: [...this.convs.values()],
-      ops: [...this.logs.values()].flatMap((l) => l.since({})),
+      ops: [...this.logs.values()].flatMap((l) => l.since({}, true)),
+      receipts: Object.fromEntries(this.receipts),
+      forgets: Object.fromEntries([...this.forgets].map(([c, f]) => [c, { upTo: f.upTo, ids: [...f.ids], hide: f.hide }])),
       mailboxes: Object.fromEntries(this.mailboxes),
       mailSince: this.mailSince,
       invite: this.invite,
@@ -640,6 +904,8 @@ export class Engine extends EventTarget {
     if (data.nameAt) await this.store.put('kv', 'nameAt', data.nameAt);
     if (data.mailSince) await this.store.put('kv', 'mailSince', data.mailSince);
     if (data.invite) await this.store.put('kv', 'invite', data.invite);
+    if (data.receipts) await this.store.put('kv', 'receipts', data.receipts);
+    if (data.forgets) await this.store.put('kv', 'forgets', data.forgets);
   }
 
   async exportBackup(passphrase) {
@@ -660,6 +926,9 @@ export class Engine extends EventTarget {
       removed: this.removed,
       mailboxes: Object.fromEntries(this.mailboxes),
       invite: this.invite, // links shared from any of our devices work on all of them
+      reads: Object.fromEntries([...this.convs.values()].filter((c) => c.readUpTo).map((c) => [c.id, c.readUpTo])),
+      receipts: Object.fromEntries(this.receipts),
+      forgets: Object.fromEntries([...this.forgets].map(([c, f]) => [c, { upTo: f.upTo, ids: [...f.ids], hide: f.hide }])),
     };
   }
 
@@ -689,6 +958,27 @@ export class Engine extends EventTarget {
     for (const [fp, list] of Object.entries(sum.mailboxes || {})) {
       if (!this.mailboxes.has(fp)) await this.setPeerMailboxes(fp, list);
     }
+    for (const [conv, upTo] of Object.entries(sum.reads || {})) {
+      if (Number.isSafeInteger(upTo)) await this.markRead(conv, upTo);
+    }
+    for (const [conv, byFp] of Object.entries(sum.receipts || {})) {
+      for (const [fp, r] of Object.entries(byFp || {})) await this.noteReceipt(conv, fp, r || {});
+    }
+    await this._serial(async () => {
+      for (const [conv, f] of Object.entries(sum.forgets || {})) {
+        if (!this.convs.has(conv) || !f || typeof f !== 'object') continue;
+        const mine = this._forgetEntry(conv);
+        let changed = maxInto(mine.upTo, cleanVV(f.upTo) || {});
+        for (const id of Array.isArray(f.ids) ? f.ids : []) {
+          if (typeof id === 'string' && id.length < 100 && !mine.ids.has(id) && mine.ids.size < MAX_FORGET_IDS) { mine.ids.add(id); changed = true; }
+        }
+        if (f.hide && !mine.hide) { mine.hide = true; changed = true; }
+        if (!changed) continue;
+        await this._saveForgets();
+        await this._dropForgotten(conv);
+        this._emit('change', { what: 'forget', conv });
+      }
+    });
   }
 
   async wipe() {

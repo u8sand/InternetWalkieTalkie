@@ -31,6 +31,17 @@ Progressive Web App on GitHub Pages.
 3. Chat. The status pill shows how many relays you're connected to and how many peers are online.
    Messages you write while a contact is offline are stored locally and sync the next time you're
    both online.
+   - **Ticks** on your messages: ◷ only on your devices so far, ✓ delivered (to one of their
+     devices, or to their mailbox relay), ✓✓ read. In a group the tick shows the least advanced
+     member; tap a message → ⋯ to see each member's state.
+   - **Typing and online**: "typing…" shows while a connected contact writes to you. Contacts show
+     a green dot while connected, otherwise when you were last connected.
+   - Settings → **Send read receipts and typing indicators** turns off both for what you send.
+     Delivery stays visible, because your device's sync shows which messages it holds.
+   - **Delete for me** (tap a message → ⋯) removes a message from all of your devices only.
+     **Delete chat** (tap the chat title) clears a whole conversation, e.g. with a contact you
+     removed. The chat leaves your list until someone writes in it again.
+   - **Search** (above the chat list) looks through every conversation on this device.
 4. **Groups**: any member who is online passes updates along to the others. So Bob and Carol can
    sync through Alice even if they never connect directly.
 5. **Direct connection codes** (Settings): connect with no relay at all by swapping two codes
@@ -108,6 +119,27 @@ Pruning works like this:
 
 Per-user retention settings could be added later on top of this, e.g. a replica that keeps less
 than the agreed period locally.
+
+#### Local deletion
+
+"Delete for me" and "Delete chat" aren't ops: they change only your own replicas. The deleted
+message's op is replaced in storage by a header-only **stub** (author, device, seq, Lamport time,
+timestamp; no ciphertext). The stub keeps its place in the version vector, so peers don't resend
+the message, and it is never sent to anyone. Your own messages keep their encrypted envelope
+until they expire, so members who haven't received them yet still can. A chat is cleared by
+recording, per stream, the highest seq you held. Copies that arrive later (say, from a slow
+member) are dropped on arrival. Your devices exchange these marks along with the address book.
+
+#### Receipts
+
+- **Delivered**: the version vectors that peers already exchange in `sync` show exactly which ops
+  each device holds. A mailbox relay's acknowledgement counts as delivered too.
+- **Read**: a member's read position is the Lamport time of the newest message they've seen.
+- Each receipt `{conv, got: vv, read}` is signed by the member. Others in a group can pass it on,
+  the same way they pass on ops, and can't forge or alter it.
+- Receipts are monotonic (merged by max), so stale or reordered ones are harmless.
+- A member who's offline but has a mailbox gets receipts mailed, at most one mail per minute.
+- **Typing** notices are ephemeral and go only over direct connections.
 
 Sync over a DataChannel works like this:
 1. Each side sends `{t:'sync', convs:{id: vv}}` for the conversations the other peer belongs to.
@@ -252,7 +284,8 @@ symmetric NATs.
 ```bash
 npm install
 npm test               # unit tests: crypto, CRDT convergence, expiry, multi-device streams and
-                       # address-book merge, forgery rejection, BIP-340 vectors
+                       # address-book merge, forgery rejection, receipts, local deletion, search,
+                       # BIP-340 vectors
 npm run test:e2e       # 3 Chromium users, a "public" relay and a user-owned mailbox relay:
                        # relay/manual WebRTC, offline catch-up, mailbox delivery while never online
                        # together, a background Periodic Sync wake-up with notification, group
