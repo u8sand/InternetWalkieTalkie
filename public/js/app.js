@@ -628,6 +628,10 @@ function showSettings() {
   const bgStatus = h('div', { class: 'muted small', text: 'Background checks: …' });
   backgroundSyncState().then((st) => { bgStatus.textContent = 'Background checks: ' + BG_TEXT[st]; });
   const notif = h('input', { type: 'checkbox', checked: !!s.notifications });
+  const myRelay = h('input', { value: s.myRelay || '', placeholder: 'wss://relay.example.org', class: 'mono', 'aria-label': 'My relay', autocomplete: 'off', spellcheck: 'false' });
+  const relayCode = h('input', { value: s.relayCode || '', placeholder: 'Access code (if it has one)', 'aria-label': 'Relay access code', autocomplete: 'off' });
+  const relayNote = !s.myRelay ? '' : net.turnStatus === 'ok' ? '✓ Connected. It can carry your connections when devices can\'t reach each other directly.'
+    : net.turnStatus ? `It will be used for finding people and as your mailbox, but not to carry connections: ${net.turnStatus}.` : 'Checking…';
   const direct = h('input', { type: 'checkbox', checked: s.directConnections !== false, 'aria-label': 'Connect directly' });
   const receipts = h('input', { type: 'checkbox', checked: s.receipts !== false, 'aria-label': 'Send read receipts and typing indicators' });
   const pass = h('input', { type: 'password', placeholder: 'Backup passphrase', autocomplete: 'new-password' });
@@ -636,6 +640,8 @@ function showSettings() {
     h('label', {}, 'Your name', name),
     h('label', { class: 'row' }, notif, h('span', { text: 'Show notifications for new messages' })),
     h('label', { class: 'row' }, receipts, h('span', { text: 'Let people see when I\'ve read their messages and when I\'m typing' })),
+    h('label', {}, 'My relay (optional). A relay you or someone you trust runs. It helps people find you, keeps messages for you while your app is closed, and carries your connection when two devices can\'t reach each other directly.', myRelay, relayCode),
+    relayNote ? h('p', { class: 'muted small', text: relayNote }) : null,
     h('details', { class: 'advanced' }, h('summary', { text: 'Advanced: network settings' }),
       h('p', { class: 'muted small', text: 'You don\'t need to change these. They control how your device finds the people you talk to.' }),
       h('label', {}, 'Meeting points (Nostr relays, one per line). Used only to help devices find each other; they never see anything readable.', relays),
@@ -653,9 +659,16 @@ function showSettings() {
         const p = await Notification.requestPermission();
         if (p !== 'granted') notif.checked = false;
       }
-      const mb = lines(mailbox);
+      let mb = lines(mailbox);
       if (mb.some((u) => !/^wss?:\/\//.test(u))) return toast('Mailbox relays must start with wss://');
-      await engine.saveSettings({ relays: lines(relays), iceServers: rows(ice), mailboxRelays: mb, notifications: notif.checked, receipts: receipts.checked, directConnections: direct.checked });
+      // "My relay" is one address used three ways: it is added to the meeting points and to the
+      // mailbox list (replacing the previous one), and asked for TURN credentials.
+      const mine = myRelay.value.trim();
+      if (mine && !/^wss?:\/\/\S+$/.test(mine)) return toast('My relay must be an address starting with wss://');
+      const swap = (list) => [...new Set([...(mine ? [mine] : []), ...list.filter((u) => u !== s.myRelay)])];
+      let rl = swap(lines(relays));
+      mb = swap(mb);
+      await engine.saveSettings({ relays: rl, myRelay: mine, relayCode: relayCode.value.trim(), iceServers: rows(ice), mailboxRelays: mb, notifications: notif.checked, receipts: receipts.checked, directConnections: direct.checked });
       setupBackgroundSync();
       toast('Saved'); closeDialog(); render();
     } })),

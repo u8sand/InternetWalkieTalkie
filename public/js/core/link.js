@@ -153,7 +153,8 @@ export class LinkHost extends LinkBase {
     h.keys = await deriveKeys(h.S);
     const relays = engine.settings.relays || [];
     if (!relays.length) throw new Error('Linking needs at least one signalling relay (Settings). You can use an encrypted backup file instead.');
-    h.code = await pack({ t: 'iwt-link', s: b64u(h.S), r: relays, i: engine.settings.iceServers || [] });
+    // The new device uses the same STUN/TURN servers, including this device's current TURN credentials.
+    h.code = await pack({ t: 'iwt-link', s: b64u(h.S), r: relays, i: engine.iceServers() });
     h.pool = new RelayPool();
     h.pool.setUrls(relays);
     h.pool.setTopics([h.keys.topic], []);
@@ -169,7 +170,7 @@ export class LinkHost extends LinkBase {
     try { msg = await open(this.keys.sig, ev.content); } catch { return; }
     if (msg.type !== 'offer' || typeof msg.sdp !== 'string') return;
     this._status('connecting');
-    const pc = this.pc = new RTCPeerConnection({ iceServers: parseIceServers(this.engine.settings.iceServers) });
+    const pc = this.pc = new RTCPeerConnection({ iceServers: parseIceServers(this.engine.iceServers()) });
     pc.ondatachannel = (e) => this._onChannel(e.channel);
     pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') this._fail('Could not connect to the new device. ' + connectHelp(pc)); };
     await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });

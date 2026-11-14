@@ -34,6 +34,9 @@ export const DEFAULT_SETTINGS = {
   // Open direct device-to-device connections (fast, needed for files; shows contacts your IP
   // address). When off, or when none can form, messages travel through the relays instead.
   directConnections: true,
+  // One relay you (or a friend) run: used for signalling, as your mailbox, and for its TURN server.
+  myRelay: '',
+  relayCode: '', // access code for that relay's TURN server, if it asks for one
 };
 
 const MAX_MAILBOXES = 4;
@@ -133,6 +136,7 @@ export class Engine extends EventTarget {
     this.now = () => Date.now(); // overridable clock (tests)
     this.limits = { ...DEFAULT_LIMITS };
     this._buckets = new Map();  // peer fp -> {tokens, at}: ingest rate limit
+    this.turnServers = [];      // short-lived TURN servers from "My relay" (kept by the network layer; never stored)
     this.held = new Map();      // conv -> Set<fp>: members over their storage budget, whose new ops we hold back
     this._queue = Promise.resolve();
   }
@@ -339,6 +343,11 @@ export class Engine extends EventTarget {
     }
     out.delete(this.identity.fp);
     return out;
+  }
+
+  /** STUN/TURN servers to use: the ones in Settings plus the TURN server of "My relay". */
+  iceServers() {
+    return [...(this.settings.iceServers || []), ...(this.turnServers || [])];
   }
 
   /** Removed contacts stay cut off until the user adds them again. */

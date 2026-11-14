@@ -7,7 +7,7 @@
 
 import { Peer } from './peer.js';
 import { RelaySession } from './relaysession.js';
-import { RelayPool, postMail, MAIL_KIND, MAIL_TTL_S } from './signaling.js';
+import { RelayPool, postMail, fetchTurn, MAIL_KIND, MAIL_TTL_S } from './signaling.js';
 import { utcDay, liveTopic, mailTopic, introTopic, introMailTopic } from './topics.js';
 import { sealSignal, openSignal } from './crypto.js';
 import { pack, unpack } from './encoding.js';
@@ -76,7 +76,7 @@ export class Network extends EventTarget {
       }
     });
     engine.addEventListener('settings', () => {
-      this._setRelays(); this._refreshTopics();
+      this._setRelays(); this._refreshTopics(); this._refreshTurn();
       // Direct connections switched off: hang up the ones we have; the relays take over.
       if (!this.directAllowed()) for (const p of [...this.peers.values(), ...this.pending.values()]) if (p.direct && !p.manual) p.close();
     });
@@ -88,13 +88,40 @@ export class Network extends EventTarget {
     this.pool.setUrls(this.engine.settings.relays || [], this.engine.settings.mailboxRelays || []);
   }
 
+  /**
+   * Keep fresh TURN credentials from "My relay" (they are short-lived). turnStatus tells the
+   * UI how that went: null (no relay set), 'ok', or the reason it failed.
+   */
+  async _refreshTurn() {
+    const { myRelay: url, relayCode: code } = this.engine.settings;
+    const key = (url || '') + '|' + (code || '');
+    if (!url) { this._turn = null; this.engine.turnServers = []; this.turnStatus = null; return; }
+    const cur = this._turn;
+    if (cur && cur.key === key && Date.now() < cur.retryAt) return;
+    this._turn = { key, retryAt: Date.now() + 60000 }; // at most one attempt a minute
+    try {
+      const { servers, ttl } = await fetchTurn(url, code);
+      if (this._turn.key !== key) return; // settings changed meanwhile
+      this.engine.turnServers = servers;
+      this._turn.retryAt = Date.now() + ttl * 500; // renew at half-life
+      this.turnStatus = 'ok';
+    } catch (e) {
+      if (this._turn?.key !== key) return;
+      this.engine.turnServers = [];
+      this.turnStatus = e.message;
+    }
+    this._emit('relays', this.pool.status());
+  }
+
   start() {
+    this._refreshTurn();
     this.files.start();
     this._setRelays();
     this._refreshTopics();
     this.timer = setInterval(() => {
       this._refreshTopics(); this._presence(); this._flushAllMail(); this._flushReceiptMail();
       if (this._heldMail) this.processInbox();
+      this._refreshTurn();
       // A relayed endpoint that has gone quiet is offline.
       for (const p of [...this.peers.values()]) if (!p.direct && Date.now() - p.lastSeen > RELAY_ALIVE_MS) p.close();
       for (const p of this.peers.values()) if (!p.ownDevice) this.engine.noteSeen(p.fp).catch(() => {});
@@ -519,7 +546,7 @@ export class Network extends EventTarget {
   // ------------------------------------------------------------ peers
 
   _newPeer(opts) {
-    const peer = new Peer(this.engine, { timeoutMs: 20000, ...opts, iceServers: this.engine.settings.iceServers });
+    const peer = new Peer(this.engine, { timeoutMs: 20000, ...opts, iceServers: this.engine.iceServers() });
     this.pending.set(peer.sid, peer);
     this.files.attach(peer);
     peer.addEventListener('ready', () => this._onReady(peer));

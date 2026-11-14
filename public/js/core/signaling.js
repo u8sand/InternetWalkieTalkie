@@ -169,6 +169,33 @@ export class RelayPool extends EventTarget {
 }
 
 /**
+ * Ask a Walkie-Talkie relay (relay/server.mjs) for short-lived credentials for its TURN
+ * server. Resolves with {servers: ["turn:host:3478?transport=udp user pass", …], ttl} or
+ * throws with the relay's reason. Other Nostr relays don't know the request and time out.
+ */
+export function fetchTurn(url, accessCode = '', timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    let ws, done = false;
+    const finish = (err, val) => { if (done) return; done = true; clearTimeout(t); try { ws?.close(); } catch {} err ? reject(err) : resolve(val); };
+    const t = setTimeout(() => finish(new Error('no answer (is this a Walkie-Talkie relay?)')), timeoutMs);
+    try { ws = new WebSocket(url); } catch { return finish(new Error('bad relay address')); }
+    ws.onopen = () => ws.send(JSON.stringify(['TURN', accessCode]));
+    ws.onerror = () => finish(new Error('could not reach the relay'));
+    ws.onmessage = (m) => {
+      let msg; try { msg = JSON.parse(m.data); } catch { return; }
+      if (!Array.isArray(msg) || msg[0] !== 'TURN') return;
+      const c = msg[1];
+      if (!c) return finish(new Error(String(msg[2] || 'refused').slice(0, 200)));
+      const word = (x) => typeof x === 'string' && /^\S{1,256}$/.test(x);
+      const urls = (Array.isArray(c.urls) ? c.urls : []).filter((u) => word(u) && /^turns?:/i.test(u)).slice(0, 4);
+      if (!urls.length || !word(c.username) || !word(c.credential)) return finish(new Error('the relay sent unusable TURN details'));
+      const ttl = Number.isFinite(c.ttl) && c.ttl > 60 ? Math.min(c.ttl, 7 * 86400) : 3600;
+      finish(null, { servers: urls.map((u) => `${u} ${c.username} ${c.credential}`), ttl });
+    };
+  });
+}
+
+/**
  * Store an encrypted mail event on a contact's own mailbox relays. Opens a short-lived
  * connection to each and resolves with the number of relays that acknowledged it (NIP-20 OK).
  */

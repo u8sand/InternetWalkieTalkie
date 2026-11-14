@@ -9,7 +9,9 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { serve } from '../serve.mjs';
-import { startRelay } from '../relay.mjs';
+// The same relay server people self-host (relay/server.mjs), so the app is tested against the real thing.
+import { startRelay as startRelayServer } from '../../relay/server.mjs';
+const startRelay = (port) => startRelayServer({ port, host: '127.0.0.1', env: {}, record: true });
 
 // Resolved via require so a globally installed Playwright (NODE_PATH) also works.
 const { chromium, devices } = createRequire(import.meta.url)('playwright');

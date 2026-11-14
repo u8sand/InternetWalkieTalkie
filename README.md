@@ -304,7 +304,8 @@ Some networks don't let two devices reach each other (strict NATs, firewalls, mo
 The app then keeps working in one of two ways, and shows which under the contact's name
 ("direct connection", "through a TURN server" or "through a relay"):
 
-- **TURN server** (Settings → STUN/TURN servers, as `turn:host:3478 username password`): carries
+- **TURN server** (from **My relay**, or Settings → STUN/TURN servers as
+  `turn:host:3478 username password`): carries
   the WebRTC connection itself, so everything works, including files and device linking.
 - **Relay fallback** (automatic): if a contact is reachable on the relays but no direct
   connection has formed after a few seconds, the same sync protocol runs over relay events
@@ -313,6 +314,15 @@ The app then keeps working in one of two ways, and shows which under the contact
   rate limits. Loss and reordering are harmless: it's the same CRDT sync, repaired by the
   periodic re-sync. Files are not sent this way; they wait for a direct connection. The app
   keeps retrying a direct connection in the background, backing off if it keeps failing.
+
+#### Your own relay
+
+`relay/` is a Docker Compose stack anyone can run, including on a Raspberry Pi: a small relay
+(meeting point and mailbox, accepting only this app's two encrypted event kinds) plus a
+[coturn](https://github.com/coturn/coturn) TURN server and optional automatic HTTPS. See
+[relay/README.md](relay/README.md). In the app it is one setting, **Settings → My relay**: the
+address is added to your meeting points and mailbox, and the app fetches short-lived TURN
+credentials from it (renewed automatically, never stored).
 
 Settings → **Connect directly** can be switched off to use relays only, which hides your IP
 address from the people you talk to (relays still see it).

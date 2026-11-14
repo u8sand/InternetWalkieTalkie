@@ -1,0 +1,13 @@
+{
+  "name": "walkie-talkie-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted relay for the Walkie-Talkie messenger: signalling, mailbox and TURN credentials",
+  "type": "module",
+  "scripts": { "start": "node server.mjs" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@noble/curves": "^1.9.0",
+    "ws": "^8.18.0"
+  }
+}
