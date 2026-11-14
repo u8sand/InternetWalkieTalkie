@@ -72,6 +72,27 @@ function waitIce(pc, ms = 4000) {
   });
 }
 
+/** Which kinds of network address an SDP offers: host (local network), srflx (public, via STUN), relay (TURN). */
+function candidateKinds(sdp) {
+  const kinds = new Set();
+  for (const m of String(sdp || '').matchAll(/^a=candidate:.* typ (\w+)/gm)) kinds.add(m[1]);
+  return kinds;
+}
+
+/**
+ * Why two devices found each other on the relay but couldn't open a direct connection, and
+ * what to do about it. The transfer never goes through a relay, so it needs a network path.
+ */
+function connectHelp(pc) {
+  const mine = candidateKinds(pc.localDescription?.sdp), theirs = candidateKinds(pc.remoteDescription?.sdp);
+  const show = (k) => (k.has('relay') ? 'TURN relay' : k.has('srflx') ? 'public address' : k.has('host') ? 'local network only' : 'no address');
+  let why;
+  if (mine.has('relay') || theirs.has('relay')) why = 'Even the TURN server could not carry the connection; check its address and credentials in Settings.';
+  else if (!mine.has('srflx') || !theirs.has('srflx')) why = 'At least one device could not find its public address, so they can only meet on the same local network. Put both on the same Wi-Fi (not a guest network), or check the STUN servers in Settings.';
+  else why = 'The networks between them block direct connections. This is common on mobile data and on guest or office Wi-Fi. Put both devices on the same home Wi-Fi and try again, or add a TURN server in Settings.';
+  return `${why} You can also move your identity with an encrypted backup file (Settings → Backup), which needs no connection. [this device: ${show(mine)}; other device: ${show(theirs)}]`;
+}
+
 function parseCode(text) {
   text = String(text).trim();
   const m = /#link=([A-Za-z0-9_-]+)/.exec(text);
@@ -140,7 +161,7 @@ export class LinkHost extends LinkBase {
     this._status('connecting');
     const pc = this.pc = new RTCPeerConnection({ iceServers: (this.engine.settings.iceServers || []).map((u) => ({ urls: u })) });
     pc.ondatachannel = (e) => this._onChannel(e.channel);
-    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') this._fail('Could not connect to the new device.'); };
+    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') this._fail('Could not connect to the new device. ' + connectHelp(pc)); };
     await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
     await pc.setLocalDescription(await pc.createAnswer());
     await waitIce(pc);
@@ -204,7 +225,7 @@ export class LinkJoin extends LinkBase {
     j.expiry = setTimeout(() => j._fail('Timed out. Make sure the other device is still showing the code.'), LINK_TTL_MS);
 
     const pc = j.pc = new RTCPeerConnection({ iceServers: (Array.isArray(info.i) ? info.i : []).map((u) => ({ urls: u })) });
-    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') j._fail('Could not connect to the other device.'); };
+    pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed') j._fail('Could not connect to the other device. ' + connectHelp(pc)); };
     j._onChannel(pc.createDataChannel('iwt-link', { ordered: true }));
     await pc.setLocalDescription(await pc.createOffer());
     await waitIce(pc);
