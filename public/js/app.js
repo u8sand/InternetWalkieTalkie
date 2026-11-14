@@ -6,6 +6,7 @@ import { Network } from './core/net.js';
 import { LinkHost, LinkJoin, LINK_TTL_MS } from './core/link.js';
 import { importCard, safetyNumber } from './core/crypto.js';
 import { b64u, fromB64u, utf8, fromUtf8 } from './core/encoding.js';
+import { fetchTurn } from './core/signaling.js';
 import qrcode from './vendor/qrcode.js';
 import { MAX_FILE_BYTES, inlineKind } from './core/files.js';
 
@@ -320,7 +321,8 @@ function openDialog(title, ...content) {
   const body = $('dialogBody');
   body.replaceChildren(
     h('div', { class: 'dlg-head' }, h('h2', { text: title }), h('button', { class: 'icon', 'aria-label': 'Close', text: '✕', onclick: closeDialog })),
-    ...content,
+    // Optional parts are passed as null/false; don't print them.
+    ...content.flat().filter((c) => c !== null && c !== undefined && c !== false && c !== ''),
   );
   if (!dlg.open) dlg.showModal();
   return body;
@@ -629,10 +631,6 @@ function showSettings() {
   const bgStatus = h('div', { class: 'muted small', text: 'Background checks: …' });
   backgroundSyncState().then((st) => { bgStatus.textContent = 'Background checks: ' + BG_TEXT[st]; });
   const notif = h('input', { type: 'checkbox', checked: !!s.notifications });
-  const myRelay = h('input', { value: s.myRelay || '', placeholder: 'wss://relay.example.org', class: 'mono', 'aria-label': 'My relay', autocomplete: 'off', spellcheck: 'false' });
-  const relayCode = h('input', { value: s.relayCode || '', placeholder: 'Access code (if it has one)', 'aria-label': 'Relay access code', autocomplete: 'off' });
-  const relayNote = !s.myRelay ? '' : net.turnStatus === 'ok' ? '✓ Connected. It can carry your connections when devices can\'t reach each other directly.'
-    : net.turnStatus ? `It will be used for finding people and as your mailbox, but not to carry connections: ${net.turnStatus}.` : 'Checking…';
   const direct = h('input', { type: 'checkbox', checked: s.directConnections !== false, 'aria-label': 'Connect directly' });
   const receipts = h('input', { type: 'checkbox', checked: s.receipts !== false, 'aria-label': 'Send read receipts and typing indicators' });
   const pass = h('input', { type: 'password', placeholder: 'Backup passphrase', autocomplete: 'new-password' });
@@ -641,8 +639,10 @@ function showSettings() {
     h('label', {}, 'Your name', name),
     h('label', { class: 'row' }, notif, h('span', { text: 'Show notifications for new messages' })),
     h('label', { class: 'row' }, receipts, h('span', { text: 'Let people see when I\'ve read their messages and when I\'m typing' })),
-    h('label', {}, 'My relay (optional). A relay you or someone you trust runs. It helps people find you, keeps messages for you while your app is closed, and carries your connection when two devices can\'t reach each other directly.', myRelay, relayCode),
-    relayNote ? h('p', { class: 'muted small', text: relayNote }) : null,
+    h('div', { class: 'section' },
+      h('h3', { text: 'Your relay' }),
+      h('p', { class: 'muted small', text: s.myRelay ? relayStatusText() : 'Optional. If your devices can\'t connect to each other (some home and mobile networks block it), or you want messages to wait for you while the app is closed, set up your own relay. It\'s free and takes about five minutes.' }),
+      h('button', { text: s.myRelay ? 'Change relay…' : 'Set up a relay…', onclick: showRelaySetup })),
     h('details', { class: 'advanced' }, h('summary', { text: 'Advanced: network settings' }),
       h('p', { class: 'muted small', text: 'You don\'t need to change these. They control how your device finds the people you talk to.' }),
       h('label', {}, 'Meeting points (Nostr relays, one per line). Used only to help devices find each other; they never see anything readable.', relays),
@@ -662,14 +662,7 @@ function showSettings() {
       }
       let mb = lines(mailbox);
       if (mb.some((u) => !/^wss?:\/\//.test(u))) return toast('Mailbox relays must start with wss://');
-      // "My relay" is one address used three ways: it is added to the meeting points and to the
-      // mailbox list (replacing the previous one), and asked for TURN credentials.
-      const mine = myRelay.value.trim();
-      if (mine && !/^wss?:\/\/\S+$/.test(mine)) return toast('My relay must be an address starting with wss://');
-      const swap = (list) => [...new Set([...(mine ? [mine] : []), ...list.filter((u) => u !== s.myRelay)])];
-      let rl = swap(lines(relays));
-      mb = swap(mb);
-      await engine.saveSettings({ relays: rl, myRelay: mine, relayCode: relayCode.value.trim(), iceServers: rows(ice), mailboxRelays: mb, notifications: notif.checked, receipts: receipts.checked, directConnections: direct.checked });
+      await engine.saveSettings({ relays: lines(relays), iceServers: rows(ice), mailboxRelays: mb, notifications: notif.checked, receipts: receipts.checked, directConnections: direct.checked });
       setupBackgroundSync();
       toast('Saved'); closeDialog(); render();
     } })),
@@ -720,6 +713,90 @@ function showSettings() {
     h('p', { class: 'muted small', style: 'margin-top:1.5em' }, h('span', { id: 'appVersion' })),
   );
   navigator.serviceWorker?.controller && caches.keys().then((k) => { const el = $('appVersion'); if (el) el.textContent = 'Cache: ' + k.join(', '); });
+}
+
+// ------------------------------------------------------------------ your relay
+
+const RELAY_DEPLOY_URL = 'https://deploy.workers.cloudflare.com/?url=https://github.com/u8sand/InternetWalkieTalkie/tree/main/worker';
+const RELAY_DOCKER_URL = 'https://github.com/u8sand/InternetWalkieTalkie/tree/main/relay#readme';
+
+function relayStatusText() {
+  const s = engine.settings, st = net.turnStatus;
+  const where = s.myRelay.replace(/^wss?:\/\//, '');
+  if (st === 'ok') return `✓ Using ${where}. It helps people find you, keeps messages while your app is closed, and carries your connection when devices can't reach each other directly.`;
+  if (st && /no TURN server/.test(st)) return `✓ Using ${where} to find people and as your mailbox. It can't carry connections yet: it has no TURN key (see "Change relay…").`;
+  if (st) return `⚠ ${where}: ${st}.`;
+  return `Using ${where}. Checking it…`;
+}
+
+/** What people paste (the workers.dev page address, a bare host name, wss://…) → a wss:// URL. */
+function relayUrl(text) {
+  let t = String(text).trim().replace(/\/+$/, '');
+  if (!t) return '';
+  if (/^https?:\/\//i.test(t)) t = t.replace(/^http/i, 'ws');
+  else if (!/^wss?:\/\//i.test(t)) t = 'wss://' + t;
+  return /^wss?:\/\/[^\s/]+(\/\S*)?$/i.test(t) ? t : null;
+}
+
+/** Use `url` as "my relay": add it to the meeting points and mailbox (replacing the previous one). */
+async function saveMyRelay(url, code) {
+  const s = engine.settings;
+  const swap = (list) => [...new Set([...(url ? [url] : []), ...(list || []).filter((u) => u !== s.myRelay)])];
+  await engine.saveSettings({ myRelay: url, relayCode: code, relays: swap(s.relays), mailboxRelays: swap(s.mailboxRelays).slice(0, 4) });
+  setupBackgroundSync();
+}
+
+function showRelaySetup() {
+  const s = engine.settings;
+  const addr = h('input', { value: s.myRelay || '', placeholder: 'https://walkie-talkie-relay.yourname.workers.dev', class: 'mono', 'aria-label': 'Relay address', autocomplete: 'off', spellcheck: 'false' });
+  const code = h('input', { value: s.relayCode || '', placeholder: 'Access code (if you set one)', 'aria-label': 'Relay access code', autocomplete: 'off' });
+  const result = h('p', { class: 'small' });
+  const step = (n, title, ...body) => h('div', { class: 'how' }, h('div', { class: 'how-icon', 'aria-hidden': 'true', text: n }), h('div', {}, h('h3', { text: title }), ...body));
+  const p = (text) => h('p', { text });
+  const link = (text, href) => h('a', { href, target: '_blank', rel: 'noopener noreferrer', class: 'button primary', text });
+
+  const save = async () => {
+    const url = relayUrl(addr.value);
+    if (url === null) { result.className = 'small warn'; result.textContent = 'That doesn\'t look like a relay address. Paste the address Cloudflare showed you, e.g. https://walkie-talkie-relay.yourname.workers.dev'; return; }
+    if (!url) { await saveMyRelay('', ''); toast('Relay removed'); closeDialog(); render(); return; }
+    btn.disabled = true;
+    result.className = 'small muted'; result.textContent = 'Checking the relay…';
+    let msg, ok = true;
+    try {
+      await fetchTurn(url, code.value.trim());
+      msg = '✓ It works, including carrying connections.';
+    } catch (e) {
+      if (/no TURN server/.test(e.message)) msg = '✓ It works for finding people and as your mailbox. To also carry connections, add a TURN key (step 1) and enter it in the Cloudflare dashboard.';
+      else if (/wrong access code/.test(e.message)) { ok = false; msg = 'The relay answered, but the access code is wrong.'; }
+      else { ok = false; msg = `Couldn't reach a relay there (${e.message}). Check the address, and that the deploy finished.`; }
+    }
+    btn.disabled = false;
+    result.className = 'small' + (ok ? '' : ' warn');
+    result.textContent = msg;
+    if (!ok) return;
+    await saveMyRelay(url, code.value.trim());
+    toast('Relay saved');
+    setTimeout(() => { closeDialog(); render(); }, 2500);
+  };
+  const btn = h('button', { class: 'primary', text: 'Check and save', onclick: save });
+
+  openDialog('Set up your relay',
+    h('p', { class: 'muted small', text: 'A relay is a small helper on the internet that you control. It never sees what you write (everything stays encrypted), but it lets your devices reach each other when your network won\'t let them connect directly, and keeps messages for you while your app is closed. You can run one for free on Cloudflare, with nothing to install.' }),
+    step('1', 'Optional: get a TURN key',
+      p('This is what lets the relay carry connections, including photos, files and linking devices. You can skip it and add it later.'),
+      p('Sign up or log in at Cloudflare (free), open Realtime → TURN Server, and click Create. Keep the Token ID and API token it shows for the next step.'),
+      link('Open the Cloudflare dashboard', 'https://dash.cloudflare.com/')),
+    step('2', 'Create the relay',
+      p('This opens Cloudflare\'s setup page for the relay. Sign up or log in, then follow its steps. It asks for TURN_KEY_ID and TURN_KEY_API_TOKEN (from step 1, or leave empty) and an ACCESS_CODE: any password you choose, which people need before your relay carries their connections. When it\'s done it shows your relay\'s address.'),
+      link('Create my relay on Cloudflare', RELAY_DEPLOY_URL)),
+    step('3', 'Paste the address here',
+      h('label', {}, 'Relay address', addr),
+      h('label', {}, 'Access code', code),
+      result,
+      h('div', { class: 'row end' }, s.myRelay ? h('button', { class: 'danger', text: 'Stop using it', onclick: () => { addr.value = ''; save(); } }) : null, btn)),
+    h('p', { class: 'muted small' }, 'Someone gave you their relay address? Just paste it in step 3. Prefer your own hardware, like a Raspberry Pi? ',
+      h('a', { href: RELAY_DOCKER_URL, target: '_blank', rel: 'noopener noreferrer', text: 'Instructions for running it yourself' }), '.'),
+  );
 }
 
 // ------------------------------------------------------------------ device linking

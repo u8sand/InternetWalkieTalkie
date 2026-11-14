@@ -34,6 +34,9 @@ button { cursor: pointer; border: 1px solid var(--line); background: var(--panel
 button:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.primary:hover { background: var(--accent-2); }
+a.button { display: inline-block; margin: .3em 0 .2em; text-decoration: none; border: 1px solid var(--line); background: var(--panel-2); border-radius: 8px; padding: .5em .9em; color: inherit; }
+a.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+a.button.primary:hover { background: var(--accent-2); }
 button.danger { color: var(--bad); }
 button.link { background: none; border: none; color: var(--accent); padding: .25em; }
 button.icon { width: 36px; height: 36px; padding: 0; display: inline-grid; place-items: center; font-size: 18px; }
