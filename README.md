@@ -13,6 +13,8 @@ Private messages that go straight from your device to theirs.
 Under the hood it's a fully decentralized, end-to-end encrypted messenger that runs as a static
 Progressive Web App on GitHub Pages.
 
+**Use it at <https://internet-walkie-talkie.u8sand.net/>**
+
 - **No servers, no accounts.** Your identity is a key pair generated on your device.
 - **Works from cache.** After the first visit, the service worker serves the whole app, so it
   still runs when GitHub Pages is unreachable.
@@ -310,10 +312,11 @@ symmetric NATs.
   you trust, or direct connection codes. WebRTC reveals IP addresses to the peers you connect to
   (contacts, and members of groups you approved).
 - **Keys are stored unencrypted in this browser profile**, readable by any script on the same
-  origin. On GitHub Pages every project site of one account shares the origin
-  `https://<user>.github.io`, so another site there (or an XSS hole in one) could read them.
-  **Serve the app from its own domain** (a custom domain in Settings → Pages, with nothing else
-  on it). Anyone with access to the unlocked device or profile has the identity too.
+  origin. That is why the app has a domain to itself (`internet-walkie-talkie.u8sand.net`) with
+  nothing else served from it. On a plain `https://<user>.github.io/<repo>/` address every
+  project site of that account shares one origin, so another site there (or an XSS hole in one)
+  could read the keys: if you host your own copy, give it its own domain too. Anyone with access
+  to the unlocked device or browser profile has the identity as well.
 - **Forward secrecy is partial.** Each op uses a fresh ephemeral key, but it's wrapped to the
   recipient's long-term ECDH key. If a device's keys are compromised, the history addressed to it
   can be decrypted. A double-ratchet layer would fix this.
@@ -374,10 +377,16 @@ notifications.
 
 ## Deploying
 
+The app is served at <https://internet-walkie-talkie.u8sand.net/>.
+
 1. Push to `main`.
-2. In **Settings → Pages**, set **Source: GitHub Actions**.
+2. In **Settings → Pages**, set **Source: GitHub Actions** and the **custom domain**.
 
 The workflow runs the unit tests, stamps `sw.js` with the commit SHA (so each deploy gets a new
 cache) and publishes `public/`. Actions are pinned to commit SHAs, npm install scripts are off,
-and only the deploy job holds publishing rights. All paths are relative, so it works under
-`https://<user>.github.io/<repo>/`.
+and only the deploy job holds publishing rights.
+
+All paths are relative, so a fork also works under `https://<user>.github.io/<repo>/`, but see
+the note on shared origins under "Threat model": use a dedicated domain for anything real.
+Identities live in the browser's storage for one address, so a copy opened at a different
+address starts empty; move an identity across with a backup file or by linking a device.
