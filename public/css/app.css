@@ -159,6 +159,19 @@ dialog::backdrop { background: rgb(0 0 0 / .55); }
 video.scan { width: 100%; border-radius: 8px; background: #000; }
 .steps { padding-left: 1.2em; color: var(--muted); }
 .or { text-align: center; margin: 1.2em 0 .4em; }
+.tagline { text-align: center; font-size: 1.05em; margin: .2em 0 .8em; }
+.pitch { list-style: none; padding: 0; margin: 0 0 .4em; display: grid; gap: .7em; }
+.pitch li { display: flex; gap: .7em; align-items: flex-start; font-size: .93em; color: var(--muted); }
+.pitch li strong { color: var(--text); }
+.pitch li > span { font-size: 1.4em; line-height: 1.1; }
+#onboardHow { display: block; margin: 0 auto .4em; }
+.how { display: flex; gap: .8em; align-items: flex-start; }
+.how-icon { font-size: 1.6em; line-height: 1.4; }
+.how h3 { margin-top: .9em; color: var(--text); text-transform: none; letter-spacing: 0; font-size: 1em; }
+.how p { margin: .3em 0; color: var(--muted); font-size: .93em; }
+.sysmsg .link { padding: 0; font-size: inherit; }
+details.advanced { margin: 1em 0; border: 1px solid var(--line); border-radius: 8px; padding: .5em .8em; }
+details.advanced summary { cursor: pointer; color: var(--muted); }
 .invite-banner { background: color-mix(in srgb, var(--accent) 15%, transparent); border: 1px solid var(--accent); border-radius: 8px; padding: .7em .9em; margin: .8em 0; }
 .qr-btn { display: block; margin: .5em auto; padding: 0; border: none; background: none; }
 .qr-btn .qr { margin: 0; }

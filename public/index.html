@@ -31,12 +31,18 @@
     <form id="onboardForm" class="card narrow">
       <img src="icons/icon.svg" alt="" class="logo">
       <h1>Walkie-Talkie</h1>
-      <p class="muted">Private messaging with no servers and no accounts. Your identity is a key pair created on this device. Messages are encrypted end to end and sync directly between devices when both are online.</p>
+      <p class="tagline">Private messages that go straight from your device to theirs.</p>
+      <ul class="pitch">
+        <li><span aria-hidden="true">📻</span><div><strong>Like a walkie-talkie.</strong> Messages travel straight to the other person, in real time, while they have the app open. No company server in the middle.</div></li>
+        <li><span aria-hidden="true">🔒</span><div><strong>Unlike a walkie-talkie, it's private.</strong> Everything is end-to-end encrypted: only the people in a chat can read it.</div></li>
+        <li><span aria-hidden="true">📱</span><div><strong>Your messages stay with you.</strong> They're stored on your device and the devices of the people you talk to, and nowhere else. No account, phone number or email needed.</div></li>
+      </ul>
+      <button type="button" id="onboardHow" class="link">How does it work?</button>
       <p id="onboardInvite" class="invite-banner" hidden></p>
-      <label>Display name
+      <label>Your name (what people you chat with will see)
         <input id="onboardName" required maxlength="64" autocomplete="nickname" placeholder="e.g. Sam">
       </label>
-      <button class="primary" type="submit">Create my identity</button>
+      <button class="primary" type="submit">Get started</button>
       <div class="or muted small">Already use Walkie-Talkie on another device?</div>
       <button type="button" id="onboardLink">Link to my other device</button>
       <button type="button" id="onboardRestore" class="link">Restore from a backup file</button>
@@ -56,6 +62,7 @@
         <div class="actions">
           <button id="btnAdd" class="icon" title="Invite or add someone" aria-label="Invite or add someone">＋</button>
           <button id="btnGroup" class="icon" title="New group" aria-label="New group">👥</button>
+          <button id="btnHow" class="icon" title="How it works" aria-label="How it works">?</button>
           <button id="btnSettings" class="icon" title="Settings" aria-label="Settings">⚙</button>
         </div>
       </header>
@@ -67,13 +74,14 @@
       <ul id="convList" class="list"></ul>
       <ul id="searchResults" class="list" hidden></ul>
       <ul id="contactList" class="list" hidden></ul>
-      <div id="offlineNote" class="note" hidden>You're offline. Running from this device's cache — messages you write are saved and will sync later.</div>
+      <div id="offlineNote" class="note" hidden>No internet connection. You can still read and write. Messages will be sent when you're back online and the other person has the app open.</div>
     </aside>
 
     <main id="chat">
       <div id="chatEmpty" class="center-screen muted">
         <div>
-          <p>Select a conversation, or add a contact to get started.</p>
+          <p>Pick a chat, or tap ＋ to invite someone.</p>
+          <p class="small">Messages go straight to the other person's device, encrypted, with no server in between.</p>
         </div>
       </div>
       <header id="chatHeader" class="bar" hidden>

@@ -43,6 +43,7 @@ async function newUser(name, { relays = [`ws://127.0.0.1:${RELAY}`], mailbox = [
   await page.waitForSelector('#main:not([hidden])');
   // Point at the local relay, no STUN (loopback only).
   await page.click('#btnSettings');
+  await page.click('summary:has-text("Advanced")');
   await page.fill('textarea[aria-label=Relays]', relays.join('\n'));
   await page.fill('textarea[aria-label="ICE servers"]', '');
   await page.fill('textarea[aria-label="Mailbox relays"]', mailbox.join('\n'));

@@ -96,7 +96,7 @@ const TICKS = {
   read: { text: '✓✓', cls: 'tick read', label: 'Read' },
   got: { text: '✓', cls: 'tick', label: 'Delivered to their device' },
   relay: { text: '✓', cls: 'tick', label: 'Delivered to their mailbox' },
-  null: { text: '◷', cls: 'tick', label: 'Not delivered yet (stored on your devices)' },
+  null: { text: '◷', cls: 'tick', label: 'Waiting: will be delivered when they open the app' },
 };
 
 function tickFor(convId, m) {
@@ -288,6 +288,28 @@ function filePreview(m) {
   if (!m.file) return m.text;
   const icon = inlineKind(m.file.mime) === 'image' ? '📷 ' + (m.text || 'Photo') : inlineKind(m.file.mime) === 'video' ? '🎬 ' + (m.text || 'Video') : '📎 ' + (m.text || m.file.name);
   return icon;
+}
+
+// ------------------------------------------------------------------ how it works
+
+function showHowItWorks() {
+  const sec = (icon, title, ...body) => h('div', { class: 'how' }, h('div', { class: 'how-icon', 'aria-hidden': 'true', text: icon }),
+    h('div', {}, h('h3', { text: title }), ...body.map((t) => h('p', { text: t }))));
+  openDialog('How Walkie-Talkie works',
+    sec('📻', 'Like a walkie-talkie',
+      'When you send a message, it goes straight from your device to the other person\'s, in real time, as long as they have the app open. There\'s no company server in the middle storing or passing on your conversations.'),
+    sec('⏳', 'When they\'re not listening',
+      'Unlike a walkie-talkie, nothing is lost. If they don\'t have the app open, your message waits safely on your device and is sent the moment you\'re both online. Under each message: ◷ waiting, ✓ delivered, ✓✓ read.',
+      'In a group, anyone in it who is online passes messages along, so the chat keeps flowing even if not everyone is around at once.'),
+    sec('🔒', 'Unlike a walkie-talkie, it\'s private',
+      'Everything is end-to-end encrypted: scrambled on your device and only unscrambled on the devices of the people in the chat. Nobody else can read it, not even the services that help your devices find each other.'),
+    sec('📱', 'Your messages stay with you',
+      'Your messages, photos and contacts are stored on your device, and on the devices of the people you talk with. Nowhere else. There\'s no account, phone number or password to steal.',
+      'That also means there\'s no cloud copy. If you lose this device, your messages go with it. To be safe, link your other devices or save a backup (Settings).'),
+    sec('🔎', 'Who can see what',
+      'To find each other over the internet, devices use public "meeting points" (relays). They only ever see scrambled data. They can\'t see who you are, who you talk to or what you say. Messages disappear automatically after a year (or sooner, if a group chooses).'),
+    h('div', { class: 'row end', style: 'margin-top:1em' }, h('button', { class: 'primary', text: 'Got it', onclick: closeDialog })),
+  );
 }
 
 // ------------------------------------------------------------------ dialogs
@@ -518,7 +540,7 @@ async function showContact(fp) {
   openDialog(engine.displayName(fp),
     h('div', { class: 'row' }, avatar(fp, engine.displayName(fp), net.isOnline(fp)),
       h('div', {}, h('div', { class: 'strong', text: k?.name || '(no name)' }),
-        h('div', { class: 'muted small', text: net.isOnline(fp) ? 'Connected directly now' : engine.seen[fp] ? 'Last seen ' + fmtAgo(engine.seen[fp]) : 'Not connected' }))),
+        h('div', { class: 'muted small', text: net.isOnline(fp) ? 'Online now, connected directly' : engine.seen[fp] ? 'Last seen ' + fmtAgo(engine.seen[fp]) : 'Not connected' }))),
     c ? h('label', {}, 'Nickname (only you see this)', nick) : h('p', { class: 'muted small', text: 'Not in your contacts — known because you share a group.' }),
     h('h3', { text: 'Safety number' }),
     h('div', { class: 'safety', text: safety }),
@@ -610,15 +632,17 @@ function showSettings() {
   const pass = h('input', { type: 'password', placeholder: 'Backup passphrase', autocomplete: 'new-password' });
 
   openDialog('Settings',
-    h('label', {}, 'Display name', name),
-    h('h3', { text: 'Your fingerprint' }),
-    h('div', { class: 'mono', text: engine.identity.fp }),
-    h('label', {}, 'Signalling relays (Nostr, one per line). Used only to find peers who are online; they see nothing readable.', relays),
-    h('label', {}, 'STUN/TURN servers (one per line). Help connections through NATs. Leave empty for LAN only.', ice),
-    h('label', {}, 'Your mailbox relays (optional, up to 4). Only list Nostr relays you run or trust: contacts store encrypted messages there for you while you are offline, kept for at most 7 days. Public relays above never store anything.', mailbox),
-    bgStatus,
+    h('label', {}, 'Your name', name),
     h('label', { class: 'row' }, notif, h('span', { text: 'Show notifications for new messages' })),
-    h('label', { class: 'row' }, receipts, h('span', { text: 'Send read receipts and typing indicators (delivery is always visible)' })),
+    h('label', { class: 'row' }, receipts, h('span', { text: 'Let people see when I\'ve read their messages and when I\'m typing' })),
+    h('details', { class: 'advanced' }, h('summary', { text: 'Advanced: network settings' }),
+      h('p', { class: 'muted small', text: 'You don\'t need to change these. They control how your device finds the people you talk to.' }),
+      h('label', {}, 'Meeting points (Nostr relays, one per line). Used only to help devices find each other; they never see anything readable.', relays),
+      h('label', {}, 'STUN/TURN servers (one per line). Help devices connect through home routers. Leave empty for the local network only.', ice),
+      h('label', {}, 'Your mailbox (optional, up to 4 Nostr relays you run or trust). People can leave encrypted messages there while your app is closed; they\'re kept for at most 7 days. Without one, messages wait until you\'re both online.', mailbox),
+      bgStatus,
+      h('h3', { text: 'Your fingerprint' }),
+      h('div', { class: 'mono', text: engine.identity.fp })),
     h('div', { class: 'row end' }, h('button', { class: 'primary', text: 'Save settings', onclick: async () => {
       if (name.value.trim() && name.value !== engine.identity.name) await engine.setName(name.value);
       const lines = (t) => t.value.split(/\s+/).map((x) => x.trim()).filter(Boolean);
@@ -655,7 +679,7 @@ function showSettings() {
 
     h('div', { class: 'section' },
       h('h3', { text: 'Backup' }),
-      h('p', { class: 'muted small', text: 'Your identity and messages exist only on this device. Export an encrypted backup to move or restore them. Photos and files aren\'t included (a restored or linked device fetches them from your contacts and other devices).' }),
+      h('p', { class: 'muted small', text: 'Your messages are only on your devices: there\'s no cloud copy. If you lose this device, they\'re gone unless you linked another device or saved a backup. A backup is a file locked with a passphrase you choose. Photos and files aren\'t included (a restored device fetches them from the people you talk to).' }),
       pass,
       h('div', { class: 'row end', style: 'margin-top:.5em' },
         h('button', { text: 'Export backup', onclick: async () => {
@@ -669,6 +693,7 @@ function showSettings() {
 
     h('div', { class: 'section' },
       h('h3', { text: 'Danger zone' }),
+      h('p', { class: 'muted small', text: 'There\'s no copy anywhere else, so this can\'t be undone.' }),
       h('button', { class: 'danger', text: 'Delete everything on this device', onclick: async () => {
         if (!confirm('This permanently deletes your identity, contacts and messages from this device. Continue?')) return;
         net.stop();
@@ -785,8 +810,10 @@ function renderStatus() {
   const peers = net.onlineCount();
   const pill = $('statusPill');
   const cls = !online ? 'bad' : r.connected ? 'ok' : 'warn';
-  const text = !online ? 'Offline' : r.connected ? `${r.connected}/${r.total} relays · ${peers} peer${peers === 1 ? '' : 's'} online` : (r.total ? 'Connecting to relays…' : `No relays · ${peers} peer${peers === 1 ? '' : 's'}`);
-  const mail = r.mailbox ? ` · mailbox ${r.mailboxOpen ? '✓' : '…'}` : '';
+  const who = peers ? ` · ${peers} ${peers === 1 ? 'person' : 'people'} online` : '';
+  const text = !online ? 'No internet' : r.connected ? 'Ready' + who : (r.total ? 'Connecting…' : 'Direct codes only' + who);
+  const mail = r.mailbox && r.mailboxOpen ? ' · mailbox ✓' : '';
+  pill.title = `${r.connected}/${r.total} relays connected`;
   pill.replaceChildren(h('span', { class: 'dot ' + cls }), text + mail);
   $('offlineNote').hidden = online;
 }
@@ -849,7 +876,7 @@ function renderLists() {
       h('div', { class: 'info' },
         h('div', { class: 'title' }, h('span', { text: title }), last ? h('span', { class: 'muted small', text: fmtTime(last.ts) }) : null),
         h('div', { class: 'row' }, h('div', { class: 'preview grow' + (typingNow ? ' typing' : ''), text: preview }), unread ? h('span', { class: 'badge', text: String(unread) }) : null)));
-  }) : [h('li', { class: 'empty' }, h('p', { text: 'No conversations yet. Invite someone to start chatting.' }), h('button', { class: 'primary', text: 'Invite someone', onclick: () => showAddContact() }), h('button', { class: 'link', text: 'Share my link', onclick: shareMyLink }))]));
+  }) : [h('li', { class: 'empty' }, h('p', { text: 'No chats yet. Like a walkie-talkie, you need someone on the other end: send them your link and you\'re connected as soon as they open it.' }), h('button', { class: 'primary', text: 'Invite someone', onclick: () => showAddContact() }), h('button', { class: 'link', text: 'Share my link', onclick: shareMyLink }))]));
 
   // Contacts + requests
   const reqs = [...engine.requests.values()];
@@ -893,18 +920,19 @@ function renderChat() {
     $('chatSub').textContent = typingNow;
   } else if (conv.kind === 'direct') {
     const other = conv.members.find((m) => m !== me);
-    $('chatSub').textContent = net.isOnline(other) ? '● Online' : engine.seen[other]
-      ? `Last seen ${fmtAgo(engine.seen[other])} · messages sync when you're both online`
-      : 'Offline · messages sync when you are both online';
+    $('chatSub').textContent = net.isOnline(other) ? '● Online now · messages arrive instantly' : (engine.seen[other]
+      ? `Last seen ${fmtAgo(engine.seen[other])}` : 'Not online') + ' · messages are delivered when they open the app';
   } else {
     const on = conv.members.filter((m) => m !== me && net.isOnline(m)).length;
-    $('chatSub').textContent = `${conv.members.length} members · ${on} online`;
+    $('chatSub').textContent = `${conv.members.length} people · ${on} online now`;
   }
 
   const box = $('messages');
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   const items = [];
-  items.push(h('div', { class: 'sysmsg', text: `🔒 End-to-end encrypted, stored only on members' devices. Messages disappear after ${fmtRetention(engine.retentionDays(conv))}.` }));
+  const between = conv.kind === 'group' ? 'the people in this group' : `you and ${engine.convTitle(conv)}`;
+  items.push(h('div', { class: 'sysmsg' }, `🔒 Only ${between} can read these messages. They're kept on your devices, not on a server, and disappear after ${fmtRetention(engine.retentionDays(conv))}. `,
+    h('button', { class: 'link small', text: 'How it works', onclick: showHowItWorks })));
   const strangers = conv.kind === 'group' && conv.trusted === false ? engine.groupStrangers(conv) : [];
   if (strangers.length) {
     const names = strangers.slice(0, 5).map((fp) => engine.displayName(fp)).join(', ') + (strangers.length > 5 ? ` and ${strangers.length - 5} more` : '');
@@ -1050,8 +1078,9 @@ function wireMain() {
   $('btnGroup').onclick = showNewGroup;
   $('btnSettings').onclick = showSettings;
   $('statusPill').onclick = () => toast(net.pool.status().connected
-    ? 'Relays only help peers find each other. Messages travel directly, encrypted, between devices.'
-    : 'Not connected to any relay. You can still connect with direct connection codes in Settings.', null, 6000);
+    ? 'Ready. Messages go straight to people who have the app open, encrypted. Public meeting points (relays) only help devices find each other.'
+    : 'Can\'t reach the meeting points that help devices find each other. Check your connection, or use direct connection codes in Settings.', null, 7000);
+  $('btnHow').onclick = showHowItWorks;
   $('btnBack').onclick = () => { stopTyping(); currentConv = null; render(); };
   $('chatTitleBtn').onclick = () => {
     const conv = engine.convs.get(currentConv);
@@ -1261,6 +1290,7 @@ async function boot() {
     if (invite) addContactFromText(invite).catch((err) => toast(err.message));
   };
   $('onboardRestore').onclick = showRestore;
+  $('onboardHow').onclick = showHowItWorks;
   $('onboardLink').onclick = () => showLinkJoin();
   // Opened someone's contact link without an identity yet: say who invited them. The hash
   // stays in place and is handled once the identity exists.
